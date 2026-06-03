@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from functools import wraps
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from werkzeug.security import check_password_hash, generate_password_hash
 
 from seed_data import QUESTIONS, STUDENTS
 
@@ -80,7 +79,13 @@ def verify_token(token):
 
 
 def hash_password(password):
-    return generate_password_hash(password, method="pbkdf2:sha256", salt_length=16)
+    salt = app.config["SECRET_KEY"][:16]
+    digest = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return f"sha256${digest}"
+
+
+def verify_password(stored_hash, password):
+    return hmac.compare_digest(stored_hash or "", hash_password(password))
 
 
 def auth_required(role):
@@ -392,7 +397,7 @@ def student_login():
     student = db().execute(
         "SELECT * FROM students WHERE student_id = ?", (student_id,)
     ).fetchone()
-    if not student or not check_password_hash(student["password_hash"], password):
+    if not student or not verify_password(student["password_hash"], password):
         return fail("学号或密码错误", 401)
     exam = current_exam()
     if not exam:
@@ -428,7 +433,7 @@ def teacher_login():
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", "")).strip()
     teacher = db().execute("SELECT * FROM teachers WHERE username = ?", (username,)).fetchone()
-    if not teacher or not check_password_hash(teacher["password_hash"], password):
+    if not teacher or not verify_password(teacher["password_hash"], password):
         return fail("教师账号或密码错误", 401)
     token = sign({"role": "teacher", "username": username, "exp": int(time.time()) + 86400})
     return ok({"token": token, "username": username})
