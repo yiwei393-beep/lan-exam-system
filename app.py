@@ -21,6 +21,7 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-before-prod
 app.config["DATABASE"] = os.environ.get(
     "DATABASE_PATH", os.path.join(app.instance_path, "exam.sqlite")
 )
+BOOTSTRAPPED = False
 
 
 def now_iso():
@@ -182,15 +183,22 @@ def seed():
     conn = db()
     init_schema()
     conn.execute(
-        "INSERT OR IGNORE INTO teachers(username, password_hash) VALUES(?, ?)",
+        """
+        INSERT INTO teachers(username, password_hash) VALUES(?, ?)
+        ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash
+        """,
         ("admin", hash_password("admin123")),
     )
     for student in STUDENTS:
         password = student["student_id"][-5:]
         conn.execute(
             """
-            INSERT OR IGNORE INTO students(student_id, name, class_name, password_hash, created_at)
+            INSERT INTO students(student_id, name, class_name, password_hash, created_at)
             VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(student_id) DO UPDATE SET
+                name = excluded.name,
+                class_name = excluded.class_name,
+                password_hash = excluded.password_hash
             """,
             (
                 student["student_id"],
@@ -365,8 +373,10 @@ def record_payload(record):
 
 @app.before_request
 def bootstrap():
-    if not os.path.exists(app.config["DATABASE"]):
+    global BOOTSTRAPPED
+    if not BOOTSTRAPPED:
         seed()
+        BOOTSTRAPPED = True
 
 
 @app.route("/")
