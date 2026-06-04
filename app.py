@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from functools import wraps
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-
 from seed_data import QUESTIONS, STUDENTS
 
 
@@ -494,6 +493,34 @@ def exam_status():
     return ok({"exam": row_dict(exam), "record": record_payload(record)})
 
 
+@app.route("/api/student/reset-exam", methods=["POST"])
+@auth_required("student")
+def reset_exam():
+    """重置学生已交卷的考试记录：清空答案、重置状态和开始时间、清除分数。"""
+    exam = current_exam()
+    conn = db()
+    record = conn.execute(
+        "SELECT * FROM exam_records WHERE exam_id = ? AND student_id = ?",
+        (exam["id"], g.user["student_id"]),
+    ).fetchone()
+    if record is None:
+        return ok(message="无需重置")
+    conn.execute("DELETE FROM answers WHERE record_id = ?", (record["id"],))
+    conn.execute(
+        """
+        UPDATE exam_records
+        SET status = ?, start_time = NULL, submit_time = NULL,
+            forced = 0, objective_score = 0, subjective_score = 0, total_score = 0,
+            confirm_name = NULL
+        WHERE id = ?
+        """,
+        ("logged_in", record["id"]),
+    )
+    conn.commit()
+    fresh = get_or_create_record(exam["id"], g.user["student_id"])
+    return ok({"record": record_payload(fresh)}, "考试记录已重置")
+
+
 @app.route("/api/exam/submit", methods=["POST"])
 @auth_required("student")
 def submit_exam():
@@ -541,6 +568,100 @@ def end_exam():
     return ok(row_dict(current_exam()), "考试已结束")
 
 
+@app.route("/api/teacher/exams", methods=["GET"])
+@auth_required("teacher")
+def list_exams():
+    """E5 考试列表 - 列出所有历史考试"""
+    rows = db().execute(
+        """
+        SELECT e.*, p.title AS paper_title
+        FROM exams e
+        LEFT JOIN papers p ON p.paper_id = e.paper_id
+        ORDER BY e.id DESC
+        """
+    ).fetchall()
+    return ok([row_dict(r) for r in rows])
+
+
+@app.route("/api/teacher/exams", methods=["POST"])
+@auth_required("teacher")
+def create_exam():
+    """E1 创建考试 - 选择已有试卷、设置名称、设置时长（默认90分钟）"""
+    data = request.get_json(force=True)
+    name = str(data.get("name", "")).strip()
+    paper_id = str(data.get("paper_id", "")).strip()
+    duration = int(data.get("duration_minutes") or 90)
+    if not name:
+        return fail("考试名称不能为空", 400)
+    if not paper_id:
+        return fail("请选择试卷", 400)
+    paper = db().execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
+    if not paper:
+        return fail("所选试卷不存在", 404)
+    db().execute(
+        """
+        INSERT INTO exams(name, paper_id, status, duration_minutes, created_at)
+        VALUES(?, ?, ?, ?, ?)
+        """,
+        (name, paper_id, "waiting", duration, now_iso()),
+    )
+    db().commit()
+    return ok(row_dict(current_exam()), "考试已创建")
+
+
+@app.route("/api/teacher/exams/<int:exam_id>/activate", methods=["POST"])
+@auth_required("teacher")
+def activate_exam(exam_id):
+    """激活指定考试（设为当前考试）"""
+    exam = db().execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone()
+    if not exam:
+        return fail("考试不存在", 404)
+    return ok(row_dict(exam), "考试已激活")
+
+
+@app.route("/api/teacher/auto-end-check", methods=["POST"])
+@auth_required("teacher")
+def auto_end_check():
+    """检查考试时长是否到期，到期则自动结束并对未交卷学生强制收卷"""
+    exam = current_exam()
+    if not exam or exam["status"] != "running":
+        return ok({"ended": False, "forced_count": 0})
+    start = exam["start_time"]
+    if not start:
+        return ok({"ended": False, "forced_count": 0})
+    try:
+        start_dt = datetime.fromisoformat(start)
+    except Exception:
+        return ok({"ended": False, "forced_count": 0})
+    elapsed = (datetime.now(timezone.utc) - start_dt).total_seconds()
+    duration_seconds = int(exam["duration_minutes"]) * 60
+    if elapsed < duration_seconds:
+        return ok({"ended": False, "forced_count": 0, "remaining_seconds": int(duration_seconds - elapsed)})
+    # 到期：结束考试 + 强制收卷所有未交卷学生
+    db().execute(
+        "UPDATE exams SET status = ?, end_time = ? WHERE id = ?",
+        ("ended", now_iso(), exam["id"]),
+    )
+    uncommitted = db().execute(
+        "SELECT id, student_id FROM exam_records WHERE exam_id = ? AND status NOT IN ('submitted', 'forced')",
+        (exam["id"],),
+    ).fetchall()
+    forced_count = 0
+    for rec in uncommitted:
+        db().execute(
+            """
+            UPDATE exam_records
+            SET status = ?, forced = 1, submit_time = COALESCE(submit_time, ?)
+            WHERE id = ?
+            """,
+            ("forced", now_iso(), rec["id"]),
+        )
+        grade_record(rec["id"])
+        forced_count += 1
+    db().commit()
+    return ok({"ended": True, "forced_count": forced_count}, "考试时长已到，已自动结束并强制收卷")
+
+
 @app.route("/api/teacher/force-submit", methods=["POST"])
 @auth_required("teacher")
 def force_submit():
@@ -559,6 +680,92 @@ def force_submit():
     db().commit()
     grade_record(record["id"])
     return ok({"record": record_payload(record)}, "已强制收卷")
+
+
+@app.route("/api/teacher/dashboard")
+@auth_required("teacher")
+def teacher_dashboard():
+    exam = current_exam()
+    students = db().execute("SELECT student_id, name, class_name FROM students ORDER BY student_id").fetchall()
+    records = db().execute(
+        "SELECT * FROM exam_records WHERE exam_id = ?", (exam["id"],)
+    ).fetchall()
+    record_map = {r["student_id"]: r for r in records}
+    total_questions = db().execute(
+        "SELECT COUNT(*) AS count FROM questions WHERE paper_id = ?", (exam["paper_id"],)
+    ).fetchone()["count"]
+    status_counts = {
+        "未登录": 0, "已登录": 0, "答题中": 0,
+        "已提交": 0, "已强制收卷": 0,
+    }
+    for student in students:
+        record = record_map.get(student["student_id"])
+        if not record:
+            status_counts["未登录"] += 1
+        else:
+            s = record["status"]
+            if s == "not_logged_in":
+                status_counts["未登录"] += 1
+            elif s == "logged_in":
+                status_counts["已登录"] += 1
+            elif s == "confirmed":
+                status_counts["已登录"] += 1
+            elif s == "answering":
+                status_counts["答题中"] += 1
+            elif s == "submitted":
+                status_counts["已提交"] += 1
+            elif s == "forced":
+                status_counts["已强制收卷"] += 1
+    answered_distribution = {"0题": 0, "1-3题": 0, "4-6题": 0, "已答完": 0}
+    for student in students:
+        record = record_map.get(student["student_id"])
+        if not record:
+            continue
+        answered = db().execute(
+            """
+            SELECT COUNT(*) AS count FROM answers
+            WHERE record_id = ? AND COALESCE(answer_text, '') != ''
+            """,
+            (record["id"],),
+        ).fetchone()["count"]
+        if answered == 0:
+            answered_distribution["0题"] += 1
+        elif answered <= 3:
+            answered_distribution["1-3题"] += 1
+        elif answered < total_questions:
+            answered_distribution["4-6题"] += 1
+        else:
+            answered_distribution["已答完"] += 1
+    score_rows = db().execute(
+        """
+        SELECT total_score FROM exam_records WHERE exam_id = ?
+        """,
+        (exam["id"],),
+    ).fetchall()
+    score_buckets = {
+        "0-59": 0, "60-69": 0, "70-79": 0, "80-89": 0, "90-100": 0,
+    }
+    for r in score_rows:
+        s = float(r["total_score"] or 0)
+        if s < 60:
+            score_buckets["0-59"] += 1
+        elif s < 70:
+            score_buckets["60-69"] += 1
+        elif s < 80:
+            score_buckets["70-79"] += 1
+        elif s < 90:
+            score_buckets["80-89"] += 1
+        else:
+            score_buckets["90-100"] += 1
+    return ok({
+        "status_distribution": status_counts,
+        "answered_distribution": answered_distribution,
+        "score_distribution": score_buckets,
+        "totals": {
+            "students": len(students),
+            "questions": total_questions,
+        }
+    })
 
 
 @app.route("/api/teacher/monitor")
@@ -718,26 +925,56 @@ def students():
 def import_students():
     file = request.files.get("file")
     if not file:
-        return fail("请上传 Excel 文件", 400)
-    from openpyxl import load_workbook
-
-    workbook = load_workbook(file, read_only=True)
-    sheet = workbook.active
+        return fail("请上传文件", 400)
+    filename = file.filename or ""
     count = 0
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-        student_id, name, class_name = [str(value or "").strip() for value in row[:3]]
-        if not student_id:
-            continue
-        db().execute(
-            """
-            INSERT OR REPLACE INTO students(student_id, name, class_name, password_hash, created_at)
-            VALUES(?, ?, ?, ?, ?)
-            """,
-            (student_id, name, class_name, hash_password(student_id[-5:]), now_iso()),
-        )
-        count += 1
+    if filename.lower().endswith((".xlsx", ".xls")):
+        try:
+            from openpyxl import load_workbook
+            workbook = load_workbook(file, read_only=True)
+            sheet = workbook.active
+            for row in sheet.iter_rows(min_row=2, values_only=True):
+                student_id, name, class_name = [str(value or "").strip() for value in row[:3]]
+                if not student_id:
+                    continue
+                db().execute(
+                    """
+                    INSERT OR REPLACE INTO students(student_id, name, class_name, password_hash, created_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (student_id, name, class_name, hash_password(student_id[-5:]), now_iso()),
+                )
+                count += 1
+        except Exception as e:
+            return fail(f"Excel 解析失败: {e}", 400)
+    elif filename.lower().endswith(".csv"):
+        try:
+            content = file.read().decode("utf-8-sig")
+            reader = csv.reader(io.StringIO(content))
+            for index, row in enumerate(reader):
+                if index == 0:
+                    continue
+                if not row:
+                    continue
+                student_id = str(row[0] or "").strip()
+                name = str(row[1] or "").strip() if len(row) > 1 else ""
+                class_name = str(row[2] or "").strip() if len(row) > 2 else ""
+                if not student_id:
+                    continue
+                db().execute(
+                    """
+                    INSERT OR REPLACE INTO students(student_id, name, class_name, password_hash, created_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (student_id, name, class_name, hash_password(student_id[-5:]), now_iso()),
+                )
+                count += 1
+        except Exception as e:
+            return fail(f"CSV 解析失败: {e}", 400)
+    else:
+        return fail("仅支持 Excel (.xlsx/.xls) 或 CSV (.csv) 文件", 400)
     db().commit()
-    return ok({"count": count}, "学生导入成功")
+    return ok({"count": count}, f"成功导入 {count} 名学生")
 
 
 @app.route("/api/grading/manual", methods=["POST"])
