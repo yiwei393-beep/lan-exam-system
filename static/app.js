@@ -942,6 +942,18 @@ async function renderPapers(main) {
   main.innerHTML = html`
     <div class="page-header">
       <h2>试卷管理</h2>
+      <div class="actions">
+        <button class="btn-success" onclick="openImportPaperModal()">&#x1F4E5; 导入试卷</button>
+        <button class="btn-outline" onclick="downloadPaperTemplate()">&#x1F4C4; 下载JSON模板</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>导入格式说明</h3>
+      <ul class="info-list">
+        <li>推荐使用 JSON：最完整，能保存题型、选项、答案、分值和关键词。</li>
+        <li>也支持 Markdown：适合手写试卷；支持 Excel：适合表格批量录入。</li>
+        <li>支持题型：单选题、多选题、判断题、简答题。</li>
+      </ul>
     </div>
     <div class="table-wrap">
       <div class="table-header">
@@ -957,6 +969,146 @@ async function renderPapers(main) {
       </table>
     </div>
   `;
+}
+
+function openImportPaperModal() {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = html`
+    <div class="modal-form">
+      <div class="modal-form-header">
+        <h3>&#x1F4E5; 导入试卷</h3>
+        <button type="button" class="close-btn" data-act="close">&#x2715;</button>
+      </div>
+      <label class="upload-zone" id="paper-upload-zone">
+        <div class="upload-icon">&#x1F4C2;</div>
+        <div class="upload-text">点击此处选择 JSON / Markdown / Excel 试卷，或拖拽到此处</div>
+        <div class="hint">支持 .json、.md、.markdown、.txt、.xlsx</div>
+        <input type="file" id="paper-file-input" accept=".json,.md,.markdown,.txt,.xlsx" hidden />
+      </label>
+      <div class="panel" style="margin:12px 0">
+        <strong>JSON 模板最推荐：</strong>
+        <p class="hint">字段包含 title、duration_minutes、questions；每道题包含 type、content、options、answer、score。</p>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn-outline" data-act="close">取消</button>
+        <button type="button" class="btn-primary" id="confirm-paper-import" disabled onclick="confirmImportPaper()">开始导入</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelectorAll('[data-act="close"]').forEach((btn) => btn.onclick = close);
+  const input = overlay.querySelector("#paper-file-input");
+  const zone = overlay.querySelector("#paper-upload-zone");
+  const confirmBtn = overlay.querySelector("#confirm-paper-import");
+  zone.onclick = () => input.click();
+  input.onchange = () => {
+    if (input.files.length) {
+      zone.querySelector(".upload-text").textContent = `已选择：${input.files[0].name}`;
+      confirmBtn.disabled = false;
+    }
+  };
+  zone.ondragover = (event) => {
+    event.preventDefault();
+    zone.classList.add("drag-over");
+  };
+  zone.ondragleave = () => zone.classList.remove("drag-over");
+  zone.ondrop = (event) => {
+    event.preventDefault();
+    zone.classList.remove("drag-over");
+    if (event.dataTransfer.files.length) {
+      input.files = event.dataTransfer.files;
+      zone.querySelector(".upload-text").textContent = `已选择：${input.files[0].name}`;
+      confirmBtn.disabled = false;
+    }
+  };
+}
+
+async function confirmImportPaper() {
+  const input = document.querySelector("#paper-file-input");
+  const confirmBtn = document.querySelector("#confirm-paper-import");
+  if (!input || !input.files.length) {
+    showToast("请先选择试卷文件", "error");
+    return;
+  }
+  const formData = new FormData();
+  formData.append("file", input.files[0]);
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = "导入中...";
+  try {
+    const headers = {};
+    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+    const res = await fetch("/api/papers/import", { method: "POST", body: formData, headers });
+    const body = await res.json();
+    if (!res.ok || body.code !== 200) throw new Error(body.message || "导入失败");
+    document.querySelector(".modal-overlay")?.remove();
+    showToast(`试卷导入成功：${body.data.title}，共 ${body.data.question_count} 题`, "success");
+    renderTeacher();
+  } catch (err) {
+    showToast(err.message, "error");
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = "开始导入";
+  }
+}
+
+function downloadPaperTemplate() {
+  const template = {
+    paper_id: "P20260605001",
+    title: "Web前端基础测试",
+    duration_minutes: 90,
+    questions: [
+      {
+        question_no: 1,
+        type: "single_choice",
+        content: "HTML 的全称是什么？",
+        options: [
+          { key: "A", value: "HyperText Markup Language" },
+          { key: "B", value: "HyperText Machine Language" },
+          { key: "C", value: "HighText Markup Language" },
+          { key: "D", value: "HyperTool Markup Language" }
+        ],
+        answer: "A",
+        score: 5
+      },
+      {
+        question_no: 2,
+        type: "multiple_choice",
+        content: "下面哪些属于前端基础技术？",
+        options: [
+          { key: "A", value: "HTML" },
+          { key: "B", value: "CSS" },
+          { key: "C", value: "JavaScript" },
+          { key: "D", value: "SQLite" }
+        ],
+        answer: "A,B,C",
+        score: 10
+      },
+      {
+        question_no: 3,
+        type: "true_false",
+        content: "CSS 可以控制网页的视觉样式。",
+        answer: "true",
+        score: 5
+      },
+      {
+        question_no: 4,
+        type: "short_answer",
+        content: "请简述前端、后端、数据库分别负责什么。",
+        answer: "",
+        keywords: ["前端", "后端", "数据库"],
+        score: 15
+      }
+    ]
+  };
+  const blob = new Blob([JSON.stringify(template, null, 2)], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "paper-template.json";
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast("试卷模板下载完成", "success");
 }
 
 /* ============================================

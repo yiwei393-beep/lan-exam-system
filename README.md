@@ -1,147 +1,138 @@
 # 局域网考试系统
 
-这是一个可部署上线的轻量级考试系统，包含学生端、教师端、SQLite 数据库、Token 登录、自动保存、断点续考、交卷、监控、批改和成绩导出。
+## 试卷一键导入
 
-## 技术栈
-
-- 后端：Python Flask
-- 数据库：SQLite
-- 前端：原生 HTML + CSS + JavaScript
-- 部署：Render / Railway / 云服务器均可
-
-## 默认账号
-
-教师端：
-
-- 账号：admin
-- 密码：admin123
-
-学生端：
-
-- 登录名：学号
-- 密码：学号后 5 位
-- 已内置 `学生名单.xlsx` 中的 43 位学生账号
-
-示例：
-
-- 学号：2407040119
-- 密码：40119
-- 姓名确认：何濯启
-
-## 本地运行
-
-```bash
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-python app.py
-```
-
-打开：
+教师登录后进入：
 
 ```text
-http://127.0.0.1:5000
+教师端 -> 试卷管理 -> 导入试卷
 ```
 
-如果在同一个局域网机房使用，学生电脑访问教师机的局域网地址，例如：
+支持格式：
 
 ```text
-http://教师机IP:5000
+JSON
+Markdown
+Excel .xlsx
 ```
 
-## 部署上线
+推荐使用 JSON，字段最完整，也最不容易出错。
 
-### Render
-
-1. 把本项目上传到 GitHub。
-2. 在 Render 创建 Web Service。
-3. Build Command 填：
-
-```bash
-pip install -r requirements.txt
-```
-
-4. Start Command 填：
-
-```bash
-gunicorn app:app
-```
-
-5. 环境变量建议设置：
+支持题型：
 
 ```text
-SECRET_KEY=换成一串足够长的随机字符
+single_choice    单选题
+multiple_choice  多选题
+true_false       判断题
+short_answer     简答题
 ```
 
-部署完成后，Render 会提供一个公网网址，其他电脑可以直接访问。
+## JSON 模板
 
-### Railway
-
-1. 新建 Railway 项目并连接 GitHub 仓库。
-2. Railway 会自动识别 Python 项目。
-3. 启动命令使用：
-
-```bash
-gunicorn app:app
+```json
+{
+  "paper_id": "P20260605001",
+  "title": "Web前端基础测试",
+  "duration_minutes": 90,
+  "questions": [
+    {
+      "question_no": 1,
+      "type": "single_choice",
+      "content": "HTML 的全称是什么？",
+      "options": [
+        { "key": "A", "value": "HyperText Markup Language" },
+        { "key": "B", "value": "HyperText Machine Language" },
+        { "key": "C", "value": "HighText Markup Language" },
+        { "key": "D", "value": "HyperTool Markup Language" }
+      ],
+      "answer": "A",
+      "score": 5
+    },
+    {
+      "question_no": 2,
+      "type": "multiple_choice",
+      "content": "下面哪些属于前端基础技术？",
+      "options": [
+        { "key": "A", "value": "HTML" },
+        { "key": "B", "value": "CSS" },
+        { "key": "C", "value": "JavaScript" },
+        { "key": "D", "value": "SQLite" }
+      ],
+      "answer": "A,B,C",
+      "score": 10
+    },
+    {
+      "question_no": 3,
+      "type": "true_false",
+      "content": "CSS 可以控制网页样式。",
+      "answer": "true",
+      "score": 5
+    },
+    {
+      "question_no": 4,
+      "type": "short_answer",
+      "content": "请简述前端、后端、数据库分别负责什么。",
+      "keywords": ["前端", "后端", "数据库"],
+      "score": 15
+    }
+  ]
+}
 ```
 
-4. 设置环境变量：
+## Markdown 模板
+
+```markdown
+# Web前端基础测试
+时长：90分钟
+
+1. [单选题] HTML 的全称是什么？
+A. HyperText Markup Language
+B. HyperText Machine Language
+C. HighText Markup Language
+D. HyperTool Markup Language
+答案：A
+分值：5
+
+2. [判断题] CSS 可以控制网页样式。
+答案：正确
+分值：5
+
+3. [简答题] 请简述前端、后端、数据库分别负责什么。
+关键词：前端,后端,数据库
+分值：15
+```
+
+## Excel 表头
+
+第一行表头可以使用中文：
 
 ```text
-SECRET_KEY=换成一串足够长的随机字符
+题号 | 题型 | 题目 | A | B | C | D | 答案 | 分值 | 关键词
 ```
 
-## 主要功能
+也可以使用英文：
 
-学生端：
+```text
+question_no | type | content | A | B | C | D | answer | score | keywords
+```
 
-- 学号和密码登录
-- 姓名确认
-- 考试须知
-- 倒计时答题
-- 题目导航
-- 自动保存
-- 断点续考
-- 手动交卷
-- 时间到自动提交
-- 提交后禁止重复提交
+题型可填写：
 
-教师端：
+```text
+单选题 / single_choice
+多选题 / multiple_choice
+判断题 / true_false
+简答题 / short_answer
+```
 
-- 教师登录
-- 系统仪表盘
-- 学生列表
-- 试卷列表
-- 开始考试
-- 结束考试
-- 实时监控
-- 强制收卷
-- 简答题人工评分
-- 成绩统计
-- 成绩导出 CSV
+## 部署更新
 
-## 数据库表
+这次新增功能涉及：
 
-系统会自动创建以下数据表：
+```text
+app.py
+static/app.js
+README.md
+```
 
-- students：学生表
-- teachers：教师表
-- papers：试卷表
-- questions：题目表
-- exams：考试表
-- exam_records：考试记录表
-- answers：答题记录表
-
-## 小组分工示例
-
-- 后端与数据库：数据库设计、API、登录认证、自动批改
-- 教师端前端：仪表盘、考试管理、监控面板、成绩管理
-- 学生端前端：登录、姓名确认、答题、倒计时、自动保存
-- 测试与文档：联调测试、README、部署说明、演示材料
-
-## 注意事项
-
-- 第一次启动时会自动初始化数据库和 43 位学生账号。
-- SQLite 数据库默认保存在 `instance/exam.sqlite`。
-- 部署到公网后，建议修改教师默认密码和 `SECRET_KEY`。
-- 如果要长期保存线上数据，不要删除部署平台的持久化磁盘或数据库文件。
+上传 GitHub 覆盖后，Render 会自动重新部署。

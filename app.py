@@ -5,6 +5,7 @@ import hmac
 import io
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -299,6 +300,245 @@ def normalize_answer(value):
     if isinstance(value, list):
         return ",".join(sorted(str(v) for v in value))
     return str(value).strip()
+
+
+def normalize_question(question, index):
+    q_type = str(question.get("type") or question.get("题型") or "single_choice").strip()
+    type_alias = {
+        "单选": "single_choice",
+        "单选题": "single_choice",
+        "single": "single_choice",
+        "single_choice": "single_choice",
+        "多选": "multiple_choice",
+        "多选题": "multiple_choice",
+        "multiple": "multiple_choice",
+        "multiple_choice": "multiple_choice",
+        "判断": "true_false",
+        "判断题": "true_false",
+        "true_false": "true_false",
+        "简答": "short_answer",
+        "简答题": "short_answer",
+        "short_answer": "short_answer",
+    }
+    q_type = type_alias.get(q_type, q_type)
+    if q_type not in {"single_choice", "multiple_choice", "true_false", "short_answer"}:
+        raise ValueError(f"第 {index} 题题型不支持：{q_type}")
+
+    content = str(question.get("content") or question.get("题目") or question.get("题干") or "").strip()
+    if not content:
+        raise ValueError(f"第 {index} 题缺少题目内容")
+
+    score = question.get("score", question.get("分值", 0))
+    try:
+        score = int(float(score))
+    except (TypeError, ValueError):
+        raise ValueError(f"第 {index} 题分值不正确")
+    if score <= 0:
+        raise ValueError(f"第 {index} 题分值必须大于 0")
+
+    raw_options = question.get("options") or question.get("选项") or []
+    options = []
+    if isinstance(raw_options, dict):
+        options = [{"key": str(k).strip().upper(), "value": str(v).strip()} for k, v in raw_options.items()]
+    elif isinstance(raw_options, list):
+        for option in raw_options:
+            if isinstance(option, dict):
+                key = str(option.get("key") or option.get("选项") or "").strip().upper()
+                value = str(option.get("value") or option.get("内容") or "").strip()
+            else:
+                text = str(option).strip()
+                match = re.match(r"^([A-Z])[\.\、\)]\s*(.+)$", text, re.I)
+                key = match.group(1).upper() if match else ""
+                value = match.group(2).strip() if match else text
+            if key and value:
+                options.append({"key": key, "value": value})
+
+    answer = question.get("answer", question.get("答案", ""))
+    if isinstance(answer, list):
+        answer = ",".join(str(item).strip().upper() for item in answer if str(item).strip())
+    else:
+        answer = str(answer).strip()
+    if q_type in {"single_choice", "multiple_choice"}:
+        answer = ",".join(part.strip().upper() for part in re.split(r"[,，\s]+", answer) if part.strip())
+        if len(options) < 2:
+            raise ValueError(f"第 {index} 题选择题至少需要 2 个选项")
+        if not answer:
+            raise ValueError(f"第 {index} 题缺少答案")
+    if q_type == "true_false":
+        true_values = {"true", "t", "1", "yes", "正确", "对", "是"}
+        false_values = {"false", "f", "0", "no", "错误", "错", "否"}
+        lowered = answer.lower()
+        if answer in true_values or lowered in true_values or "正" in answer or "对" in answer:
+            answer = "true"
+        elif answer in false_values or lowered in false_values or "错" in answer or "误" in answer:
+            answer = "false"
+        else:
+            raise ValueError(f"第 {index} 题判断题答案请填写 正确/错误 或 true/false")
+
+    keywords = question.get("keywords") or question.get("关键词") or []
+    if isinstance(keywords, str):
+        keywords = [item.strip() for item in re.split(r"[,，、\s]+", keywords) if item.strip()]
+
+    return {
+        "question_no": int(question.get("question_no") or question.get("题号") or index),
+        "type": q_type,
+        "content": content,
+        "options": options,
+        "answer": answer,
+        "score": score,
+        "keywords": keywords,
+    }
+
+
+def parse_json_paper(text):
+    data = json.loads(text)
+    if isinstance(data, list):
+        data = {"questions": data}
+    questions = [normalize_question(q, i + 1) for i, q in enumerate(data.get("questions", []))]
+    return {
+        "paper_id": str(data.get("paper_id") or f"P{int(time.time())}"),
+        "title": str(data.get("title") or "导入试卷"),
+        "duration_minutes": int(data.get("duration_minutes") or data.get("duration") or 90),
+        "questions": questions,
+    }
+
+
+def parse_markdown_paper(text):
+    title = "导入试卷"
+    duration = 90
+    questions = []
+    current = None
+    option_re = re.compile(r"^[\-\*]?\s*([A-D])[\.\、\)]\s*(.+)$", re.I)
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("# "):
+            title = line[2:].strip() or title
+            continue
+        if line.startswith("时长") or line.lower().startswith("duration"):
+            match = re.search(r"\d+", line)
+            if match:
+                duration = int(match.group())
+            continue
+        question_match = re.match(r"^(?:#{2,3}\s*)?(?:第?\s*)?(\d+)[\.\、\)]\s*(?:\[(.+?)\])?\s*(.+)$", line)
+        if question_match:
+            if current:
+                questions.append(current)
+            current = {
+                "question_no": int(question_match.group(1)),
+                "type": question_match.group(2) or "single_choice",
+                "content": question_match.group(3).strip(),
+                "options": [],
+                "answer": "",
+                "score": 5,
+                "keywords": [],
+            }
+            continue
+        if not current:
+            continue
+        option_match = option_re.match(line)
+        if option_match:
+            current["options"].append({"key": option_match.group(1).upper(), "value": option_match.group(2).strip()})
+            continue
+        if line.startswith("答案") or line.lower().startswith("answer"):
+            current["answer"] = line.split(":", 1)[-1].split("：", 1)[-1].strip()
+            continue
+        if line.startswith("分值") or line.lower().startswith("score"):
+            match = re.search(r"\d+", line)
+            if match:
+                current["score"] = int(match.group())
+            continue
+        if line.startswith("关键词") or line.lower().startswith("keywords"):
+            current["keywords"] = line.split(":", 1)[-1].split("：", 1)[-1].strip()
+            continue
+    if current:
+        questions.append(current)
+    return {
+        "paper_id": f"P{int(time.time())}",
+        "title": title,
+        "duration_minutes": duration,
+        "questions": [normalize_question(q, i + 1) for i, q in enumerate(questions)],
+    }
+
+
+def parse_excel_paper(file_storage):
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(file_storage, read_only=True)
+    sheet = workbook.active
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("Excel 文件为空")
+    headers = [str(cell or "").strip() for cell in rows[0]]
+    index = {name: pos for pos, name in enumerate(headers)}
+
+    def value(row, *names):
+        for name in names:
+            if name in index and index[name] < len(row):
+                return row[index[name]]
+        return ""
+
+    questions = []
+    title = "导入试卷"
+    duration = 90
+    for row in rows[1:]:
+        if not any(row):
+            continue
+        q = {
+            "question_no": value(row, "题号", "question_no"),
+            "type": value(row, "题型", "type"),
+            "content": value(row, "题目", "题干", "content"),
+            "options": {
+                "A": value(row, "A", "选项A"),
+                "B": value(row, "B", "选项B"),
+                "C": value(row, "C", "选项C"),
+                "D": value(row, "D", "选项D"),
+            },
+            "answer": value(row, "答案", "answer"),
+            "score": value(row, "分值", "score"),
+            "keywords": value(row, "关键词", "keywords"),
+        }
+        questions.append(normalize_question(q, len(questions) + 1))
+    return {"paper_id": f"P{int(time.time())}", "title": title, "duration_minutes": duration, "questions": questions}
+
+
+def save_imported_paper(paper):
+    questions = paper.get("questions", [])
+    if not questions:
+        raise ValueError("试卷中没有题目")
+    paper_id = paper.get("paper_id") or f"P{int(time.time())}"
+    title = paper.get("title") or "导入试卷"
+    duration = int(paper.get("duration_minutes") or 90)
+    total_score = sum(int(q["score"]) for q in questions)
+    conn = db()
+    existing = conn.execute("SELECT paper_id FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
+    if existing:
+        paper_id = f"{paper_id}_{int(time.time())}"
+    conn.execute(
+        "INSERT INTO papers(paper_id, title, total_score, duration_minutes, created_at) VALUES(?, ?, ?, ?, ?)",
+        (paper_id, title, total_score, duration, now_iso()),
+    )
+    for index, q in enumerate(questions, 1):
+        conn.execute(
+            """
+            INSERT INTO questions(paper_id, question_no, type, content, options_json, answer, score, keywords_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                paper_id,
+                q.get("question_no") or index,
+                q["type"],
+                q["content"],
+                json.dumps(q.get("options", []), ensure_ascii=False),
+                q.get("answer", ""),
+                int(q["score"]),
+                json.dumps(q.get("keywords", []), ensure_ascii=False),
+            ),
+        )
+    conn.commit()
+    return {"paper_id": paper_id, "title": title, "total_score": total_score, "question_count": len(questions)}
 
 
 def save_answers(record_id, answers):
@@ -909,6 +1149,32 @@ def delete_paper(paper_id):
     db().execute("DELETE FROM papers WHERE paper_id = ?", (paper_id,))
     db().commit()
     return ok(message="试卷已删除")
+
+
+@app.route("/api/papers/import", methods=["POST"])
+@auth_required("teacher")
+def import_paper():
+    file = request.files.get("file")
+    if not file:
+        return fail("请上传 JSON、Markdown 或 Excel 试卷文件", 400)
+    filename = (file.filename or "").lower()
+    try:
+        if filename.endswith(".json"):
+            paper = parse_json_paper(file.read().decode("utf-8-sig"))
+        elif filename.endswith((".md", ".markdown", ".txt")):
+            paper = parse_markdown_paper(file.read().decode("utf-8-sig"))
+        elif filename.endswith((".xlsx", ".xlsm")):
+            paper = parse_excel_paper(file)
+        else:
+            return fail("暂时支持 .json、.md、.markdown、.txt、.xlsx 格式", 400)
+        result = save_imported_paper(paper)
+        return ok(result, "试卷导入成功")
+    except json.JSONDecodeError:
+        return fail("JSON 格式不正确，请检查文件内容", 400)
+    except ValueError as exc:
+        return fail(str(exc), 400)
+    except Exception as exc:
+        return fail(f"导入失败：{exc}", 500)
 
 
 @app.route("/api/students")
