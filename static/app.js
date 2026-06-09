@@ -1,22 +1,44 @@
+/* ============================================
+   局域网考试系统 - 前端 (Vue-free, 原生 JS)
+   - 国际化（i18n）: 中 / 英
+   - 学生端：登录 → 姓名确认 → 试卷选择 → 须知 → 答题
+   - 教师端：仪表盘 / 学生 / 试卷 / 考试 / 监控 / 批改 / 成绩
+   - 新功能：试卷导入、填空题、Excel 导出、考试次数控制、批改筛选
+   ============================================ */
+
 const state = {
   role: localStorage.getItem("role"),
   token: localStorage.getItem("token"),
   student: JSON.parse(localStorage.getItem("student") || "null"),
   teacherTab: "dashboard",
   examData: null,
+  currentExam: null,
+  currentRecordId: null,
   answers: {},
   currentQuestion: 0,
   saveTimer: null,
   monitorTimer: null,
+  countdown: null,
   chartInstances: [],
+  // 教师端缓存
+  grading: { examId: null, status: "all", keyword: "", sort: "student_id", order: "asc", page: 1, perPage: 20 },
+  results: { examId: null, className: "" },
+  monitorExamId: null,
+  resultsExamId: null,
+  examAdminSelectedId: null,
+  // 学生端缓存
+  studentExams: [],
+  selectedExam: null,
+  // 试卷导入
+  importPaper: { file: null, errors: [] },
 };
 
 const $app = document.querySelector("#app");
 
 /* ============================================
-   自定义弹窗工具 (替代浏览器 confirm/alert)
+   自定义弹窗 / Toast
    ============================================ */
-function showModal({ icon = "&#x26A0;&#xFE0F;", title, message, confirmText = "确定", cancelText = "取消", danger = false, onConfirm, onCancel }) {
+function showModal({ icon = "&#x26A0;&#xFE0F;", title, message, confirmText, cancelText, danger = false, onConfirm, onCancel }) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   overlay.innerHTML = html`
@@ -25,8 +47,8 @@ function showModal({ icon = "&#x26A0;&#xFE0F;", title, message, confirmText = "�
       <h3>${title}</h3>
       <p>${message}</p>
       <div class="modal-actions">
-        <button class="btn-outline" data-act="cancel">${cancelText}</button>
-        <button class="${danger ? 'btn-danger' : 'btn-primary'}" data-act="confirm">${confirmText}</button>
+        <button class="btn-outline" data-act="cancel">${cancelText || t("common.cancel")}</button>
+        <button class="${danger ? 'btn-danger' : 'btn-primary'}" data-act="confirm">${confirmText || t("common.confirm")}</button>
       </div>
     </div>
   `;
@@ -59,20 +81,58 @@ function clearCharts() {
   state.chartInstances = [];
 }
 
-function api(path, options = {}) {
+function clearTimers() {
+  if (state.countdown) { clearInterval(state.countdown); state.countdown = null; }
+  if (state.saveTimer) { clearInterval(state.saveTimer); state.saveTimer = null; }
+  if (state.monitorTimer) { clearTimeout(state.monitorTimer); state.monitorTimer = null; }
+  try { window.removeEventListener("beforeunload", autoSave); } catch (e) { /* ignore */ }
+}
+
+function translateError(message) {
+  if (!message) return t("error.UNKNOWN");
+  // 形如 "EXAM_NOT_FOUND" 的代码映射；其他原文返回
+  const key = `error.${message}`;
+  if (key !== t("error.UNKNOWN") && i18n.dict[key]) return t(key);
+  return message;
+}
+
+async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  return fetch(path, { ...options, headers }).then(async (res) => {
-    if (path.includes("/export")) return res;
-    const body = await res.json();
-    if (!res.ok || body.code !== 200) throw new Error(body.message || "请求失败");
-    return body.data;
-  });
+  const loc = (window.i18n && i18n.locale) || "zh-CN";
+  headers["X-Locale"] = loc;
+  const sep = path.includes("?") ? "&" : "?";
+  const finalPath = path.includes("/papers/template") || path.includes("/export")
+    ? path
+    : `${path}${sep}locale=${encodeURIComponent(loc)}`;
+  const res = await fetch(finalPath, { ...options, headers });
+  if (path.includes("/export") || path.includes("/papers/template")) {
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res;
+  }
+  let body;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!body) {
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return null;
+  }
+  if (!res.ok || (body.code && body.code !== 200)) {
+    const err = new Error(translateError(body.message || `HTTP ${res.status}`));
+    err.code = body.message;
+    err.status = res.status;
+    err.data = body.data;
+    throw err;
+  }
+  return body.data;
 }
 
 function html(strings, ...values) {
   return strings.reduce((out, s, i) => out + s + (values[i] ?? ""), "");
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 function setSession(role, token, student = null) {
@@ -82,51 +142,194 @@ function setSession(role, token, student = null) {
   localStorage.setItem("role", role);
   localStorage.setItem("token", token);
   if (student) localStorage.setItem("student", JSON.stringify(student));
+  else localStorage.removeItem("student");
 }
 
 function logout() {
   clearCharts();
-  localStorage.clear();
-  Object.assign(state, { role: null, token: null, student: null, examData: null, answers: {} });
-  clearInterval(state.saveTimer);
-  clearInterval(state.monitorTimer);
-  clearInterval(state.countdown);
+  clearTimers();
+  localStorage.removeItem("role");
+  localStorage.removeItem("token");
+  localStorage.removeItem("student");
+  Object.assign(state, { role: null, token: null, student: null, examData: null, answers: {}, currentExam: null, currentRecordId: null });
   renderHome();
 }
 
 /* ============================================
-   首页 - 选择登录角色
+   语言切换器
+   ============================================ */
+function langSwitcher() {
+  const cur = (window.i18n && i18n.locale) || "zh-CN";
+  return html`
+    <div class="lang-switcher" title="${t("nav.language")}">
+      <button class="lang-btn ${cur === 'zh-CN' ? 'active' : ''}" data-lang="zh-CN">${t("lang.zh")}</button>
+      <button class="lang-btn ${cur === 'en-US' ? 'active' : ''}" data-lang="en-US">${t("lang.en")}</button>
+    </div>
+  `;
+}
+
+function bindLangSwitcher() {
+  document.querySelectorAll(".lang-switcher .lang-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const lang = btn.dataset.lang;
+      i18n.setLocale(lang);
+    });
+  });
+}
+
+/* ============================================
+   状态 / 题型中文
+   ============================================ */
+function statusName(status) {
+  return t(`status.${status}`) || status;
+}
+
+function questionTypeName(type) {
+  return t(`type.${type}`) || type;
+}
+
+function formatTime(iso) {
+  if (!iso) return "-";
+  try {
+    const d = new Date(iso);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch (e) { return iso; }
+}
+
+/* ============================================
+   首页
    ============================================ */
 function renderHome() {
-  if (state.role === "teacher" && state.token) return renderTeacher();
-  if (state.role === "student" && state.token) return renderStudentGate();
+  // 教师端：恢复上次所在的标签页
+  if (state.role === "teacher" && state.token) {
+    const savedTab = localStorage.getItem("teacherTab");
+    if (savedTab) state.teacherTab = savedTab;
+    const savedMonitor = localStorage.getItem("monitorExamId");
+    if (savedMonitor) state.monitorExamId = parseInt(savedMonitor, 10) || null;
+    const savedResults = localStorage.getItem("resultsExamId");
+    if (savedResults) state.resultsExamId = parseInt(savedResults, 10) || null;
+    const savedGrading = localStorage.getItem("gradingExamId");
+    if (savedGrading) {
+      try {
+        const g = JSON.parse(savedGrading);
+        if (g && typeof g === "object") Object.assign(state.grading, g);
+      } catch (e) { /* ignore */ }
+    }
+    return renderTeacher();
+  }
+  // 学生端：刷新后恢复之前的页面（gate / 试卷列表 / 答题页）
+  if (state.role === "student" && state.token) {
+    const savedStudentPage = localStorage.getItem("studentPage");
+    // 正在考试中 -> 恢复答题页
+    const examInProgress = localStorage.getItem("examInProgress") === "1";
+    const activeExamId = parseInt(localStorage.getItem("activeExamId") || "0", 10);
+    const activeRecordId = parseInt(localStorage.getItem("activeRecordId") || "0", 10);
+    if (examInProgress && activeExamId && activeRecordId) {
+      // 通过 /api/exam/paper 校验：若该 record 仍可继续则恢复答题页
+      // 否则清理持久化并退回选择列表
+      return restoreExamSession(activeExamId, activeRecordId);
+    }
+    if (savedStudentPage === "exams") {
+      // 已经在选择试卷页（不是确认页）→ 直接展示
+      return renderStudentExamList();
+    }
+    // 默认到确认页
+    return renderStudentGate();
+  }
   $app.innerHTML = html`
     <section class="login-wrap">
       <div class="login-card">
         <div class="login-logo">
           <span class="login-logo-text">LAN<br/>EXAM</span>
         </div>
-        <h1>局域网考试系统</h1>
-        <p class="subtitle">请选择您的登录身份</p>
-        <button class="btn-primary" onclick="renderStudentLogin()">学生登录</button>
-        <button class="btn-outline" onclick="renderTeacherLogin()">教师登录</button>
-        <p class="login-hint">学生账号为学号，密码为学号后5位<br/>教师默认账号 admin / admin123</p>
+        <div style="display:flex;justify-content:flex-end;margin-bottom:8px">${langSwitcher()}</div>
+        <h1>${t("login.welcome")}</h1>
+        <p class="subtitle">${t("login.chooseRole")}</p>
+        <button class="btn-primary" onclick="renderStudentLogin()">${t("login.student")}</button>
+        <button class="btn-outline" onclick="renderTeacherLogin()">${t("login.teacher")}</button>
+        <p class="login-hint">${t("login.passwordHint")}<br/>${t("login.teacher")}账号和密码请手动输入</p>
       </div>
     </section>
   `;
+  bindLangSwitcher();
+}
+
+/**
+ * 刷新后恢复答题会话：先验证 record 状态，再决定恢复答题页或退回列表。
+ */
+async function restoreExamSession(examId, recordId) {
+  try {
+    // 先获取考试列表（如未缓存）
+    if (!state.studentExams || !state.studentExams.length) {
+      try {
+        const listData = await api("/api/student/exams");
+        state.studentExams = (listData && listData.exams) || [];
+      } catch (e) {
+        // token 可能失效，保持在 gate
+        return renderStudentGate();
+      }
+    }
+    const exam = (state.studentExams || []).find((e) => e.exam_id === examId);
+    if (!exam) {
+      // 考试不可见 → 退回选择列表
+      clearExamPersistence();
+      return renderStudentGate();
+    }
+    state.currentExam = { id: examId };
+    state.currentRecordId = recordId;
+    state.antiCheatBound = false;
+    // 拉取试卷以校验状态
+    const data = await api(`/api/exam/paper?exam_id=${examId}&record_id=${recordId}`);
+    if (data && data.record) {
+      const st = data.record.status;
+      if (st === "submitted" || st === "forced") {
+        // 已收卷 → 退回选择列表
+        clearExamPersistence();
+        return renderStudentExamList();
+      }
+      state.examData = data;
+      state.answers = data.record.answers || {};
+      state.currentExamInfo = exam;
+      renderExam();
+      state.saveTimer = setInterval(autoSave, 30000);
+      window.addEventListener("beforeunload", autoSave);
+      return;
+    }
+  } catch (err) {
+    if (err && err.code === "ALREADY_SUBMITTED") {
+      clearExamPersistence();
+      return renderStudentExamList();
+    }
+    // 其它错误（401 等）→ 退回登录/确认页
+    console.warn("restoreExamSession failed", err);
+    clearExamPersistence();
+    return renderStudentGate();
+  }
+  // fallback
+  clearExamPersistence();
+  renderStudentGate();
+}
+
+function clearExamPersistence() {
+  try {
+    localStorage.removeItem("examInProgress");
+    localStorage.removeItem("activeRecordId");
+    localStorage.removeItem("activeExamId");
+  } catch (e) { /* ignore */ }
 }
 
 /* ============================================
-   学生登录页 - 左右分栏设计
+   学生登录
    ============================================ */
 function renderStudentLogin() {
   $app.innerHTML = html`
     <section class="login-wrap">
       <div class="login-split">
         <div class="login-branding">
-          <h2>局域网考试系统</h2>
+          <h2>${t("login.welcome")}</h2>
           <p class="en-title">LAN Exam System</p>
-          <p class="tagline">安全 · 稳定 · 高效</p>
+          <p class="tagline">${t("login.brandTagline")}</p>
           <div class="features">
             <div class="feature-icon">&#x1F4D3;</div>
             <div class="feature-icon">&#x23F0;</div>
@@ -134,26 +337,28 @@ function renderStudentLogin() {
           </div>
         </div>
         <div class="login-form-side">
+          <div style="display:flex;justify-content:flex-end">${langSwitcher()}</div>
           <form onsubmit="studentLogin(event)">
-            <h1>学生登录</h1>
-            <p class="subtitle">请输入学号和密码进行登录</p>
+            <h1>${t("login.student")}</h1>
+            <p class="subtitle">${t("login.welcome")} / ${t("login.student")}</p>
             <div class="field">
-              <label>学号</label>
-              <input name="student_id" placeholder="请输入学号" required />
+              <label>${t("login.studentId")}</label>
+              <input name="student_id" placeholder="${t("login.studentIdPlaceholder")}" required />
             </div>
             <div class="field">
-              <label>密码</label>
-              <input name="password" type="password" placeholder="请输入密码（学号后5位）" required />
+              <label>${t("login.password")}</label>
+              <input name="password" type="password" placeholder="${t("login.passwordPlaceholder")}" required />
             </div>
-            <p class="password-hint">初始密码为学号后5位</p>
-            <button type="submit" class="btn-primary">登 录</button>
-            <p class="footer-hint">如遇问题请联系监考老师</p>
+            <p class="password-hint">${t("login.passwordHint")}</p>
+            <button type="submit" class="btn-primary">${t("login.submit")}</button>
+            <p class="footer-hint">${t("login.footerHint")}</p>
             <div id="msg" class="msg"></div>
           </form>
         </div>
       </div>
     </section>
   `;
+  bindLangSwitcher();
 }
 
 async function studentLogin(event) {
@@ -165,27 +370,14 @@ async function studentLogin(event) {
       body: JSON.stringify(Object.fromEntries(form)),
     });
     setSession("student", data.token, data.student);
-    await checkAndResetSubmittedExam();
     renderStudentGate();
   } catch (err) {
     document.querySelector("#msg").textContent = err.message;
   }
 }
 
-async function checkAndResetSubmittedExam() {
-  try {
-    const data = await api("/api/exam/status");
-    const status = data && data.record && data.record.status;
-    if (status === "submitted" || status === "forced") {
-      await api("/api/student/reset-exam", { method: "POST", body: JSON.stringify({}) });
-      showToast("已开启新一轮答题，原有答卷已重置", "info");
-    }
-  } catch (err) {
-  }
-}
-
 /* ============================================
-   教师登录页 - 居中卡片设计
+   教师登录
    ============================================ */
 function renderTeacherLogin() {
   $app.innerHTML = html`
@@ -194,22 +386,24 @@ function renderTeacherLogin() {
         <div class="login-logo">
           <span class="login-logo-text">LAN<br/>EXAM</span>
         </div>
-        <h1>教师登录</h1>
-        <p class="subtitle">局域网考试管理系统</p>
+        <div style="display:flex;justify-content:flex-end;margin-bottom:8px">${langSwitcher()}</div>
+        <h1>${t("login.teacher")}</h1>
+        <p class="subtitle">${t("login.welcome")} / ${t("login.teacher")}</p>
         <div class="field">
-          <label>用户名</label>
-          <input name="username" placeholder="请输入用户名" value="admin" required />
+          <label>${t("login.username")}</label>
+          <input name="username" placeholder="${t("login.username")}" value="admin" required />
         </div>
         <div class="field">
-          <label>密码</label>
-          <input name="password" type="password" placeholder="请输入密码" value="admin123" required />
+          <label>${t("login.password")}</label>
+          <input name="password" type="password" placeholder="${t("login.passwordPlaceholder")}" required autocomplete="current-password" />
         </div>
-        <button type="submit" class="btn-primary">登 录</button>
-        <button type="button" class="btn-outline" onclick="renderHome()">返回</button>
+        <button type="submit" class="btn-primary">${t("login.submit")}</button>
+        <button type="button" class="btn-outline" onclick="renderHome()">${t("login.back")}</button>
         <div id="msg" class="msg"></div>
       </form>
     </section>
   `;
+  bindLangSwitcher();
 }
 
 async function teacherLogin(event) {
@@ -227,23 +421,23 @@ async function teacherLogin(event) {
 }
 
 /* ============================================
-   姓名确认页
+   学生姓名确认
    ============================================ */
 function renderStudentGate() {
   $app.innerHTML = html`
     <section class="login-wrap">
       <div class="confirm-card">
         <div class="confirm-icon">&#x1F464;</div>
-        <h1>请确认您的姓名</h1>
-        <p class="desc">系统识别到您的姓名为：</p>
+        <h1>${t("confirm.title")}</h1>
+        <p class="desc">${t("confirm.desc")}</p>
         <div class="name-display">
-          <span class="name">${state.student.name || '未知'}</span>
+          <span class="name">${state.student ? (state.student.name || t("confirm.unknownName")) : t("confirm.unknownName")}</span>
         </div>
         <form onsubmit="confirmName(event)">
-          <input type="hidden" name="name" value="${state.student.name || ''}" />
+          <input type="hidden" name="name" value="${state.student ? state.student.name || '' : ''}" />
           <div class="confirm-actions">
-            <button type="submit" class="btn-primary">确认无误</button>
-            <button type="button" class="btn-outline-danger" onclick="logout()">信息有误</button>
+            <button type="submit" class="btn-primary">${t("login.confirmRight")}</button>
+            <button type="button" class="btn-outline-danger" onclick="logout()">${t("login.confirmWrong")}</button>
           </div>
           <div id="msg" class="msg"></div>
         </form>
@@ -259,59 +453,218 @@ async function confirmName(event) {
       method: "POST",
       body: JSON.stringify(Object.fromEntries(new FormData(event.target))),
     });
-    renderInstructions();
+    try { localStorage.setItem("studentPage", "exams"); } catch (e) { /* ignore */ }
+    renderStudentExamList();
   } catch (err) {
     document.querySelector("#msg").textContent = err.message;
   }
 }
 
 /* ============================================
-   考试须知页
+   学生端 - 试卷选择页
    ============================================ */
-async function renderInstructions() {
-  const data = await api("/api/exam/current");
-  const questionTypes = "单选题、多选题、判断题、简答题";
+async function renderStudentExamList() {
+  try {
+    const data = await api("/api/student/exams");
+    state.studentExams = data.exams || [];
+  } catch (err) {
+    showToast(err.message, "error");
+    return;
+  }
+  $app.innerHTML = html`
+    <div class="exam-list-wrap">
+      <div class="exam-list-header">
+        <div class="brand-mini">
+          <span style="width:32px;height:32px;border-radius:8px;background:var(--primary-bg);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--primary)">LAN<br/>EXAM</span>
+          ${t("login.welcome")}
+        </div>
+        <div class="user-info">
+          <span>${state.student ? `${state.student.name} (${state.student.student_id})` : ""}</span>
+          ${langSwitcher()}
+          <button class="btn-outline btn-sm" onclick="logout()">${t("nav.logout")}</button>
+        </div>
+      </div>
+      <h2 class="exam-list-title">${t("examList.title")}</h2>
+      ${renderStudentExamCards()}
+    </div>
+  `;
+  bindLangSwitcher();
+  bindExamCardEvents();
+}
+
+function renderStudentExamCards() {
+  const exams = state.studentExams || [];
+  if (exams.length === 0) {
+    return `<div class="panel" style="text-align:center;color:var(--text-secondary)">${t("examList.noExam")}</div>`;
+  }
+  return `<div class="exam-list">${exams.map((e) => renderStudentExamCard(e)).join("")}</div>`;
+}
+
+function renderStudentExamCard(e) {
+  const statusBadge = (text, cls = "") => `<span class="badge ${cls}">${text}</span>`;
+  const myStatus = e.my_status;
+  // 任何"考试自身未开/已关"的情况：包括 ended_locked / not_open / finished
+  const examClosed = myStatus === "ended_locked" || myStatus === "not_open" || myStatus === "finished";
+  const locked = examClosed;
+  let action = "";
+  let badge = "";
+
+  if (myStatus === "ended_locked") {
+    badge = statusBadge(t("examList.status.ended"), "danger");
+    action = `<button class="btn-outline" disabled>${t("examList.view")}</button>`;
+  } else if (myStatus === "not_open") {
+    badge = statusBadge(t("examList.notOpen"), "warning");
+    action = `<button class="btn-outline" disabled>${t("examList.notOpen")}</button>`;
+  } else if (myStatus === "finished") {
+    badge = statusBadge(t("examList.status.locked"), "danger");
+    action = `<button class="btn-outline" disabled>${t("examList.view")}</button>`;
+  } else if (myStatus === "submitted_retryable") {
+    badge = statusBadge(`${t("examList.attemptInfo", { used: e.used_attempts, max: e.max_attempts })}`, "warning");
+    action = `<button class="btn-primary" data-act="start" data-exam-id="${e.exam_id}">${t("examList.retry")}</button>`;
+  } else if (myStatus === "answering" || myStatus === "confirmed" || myStatus === "logged_in") {
+    // 已有活动记录（已登录/已确认/答题中）：统一显示为"可继续"，点击直接续考
+    badge = statusBadge(t("examList.status.available"), "");
+    action = `<button class="btn-primary" data-act="start" data-exam-id="${e.exam_id}">${t("examList.resume")}</button>`;
+  } else {
+    // not_started
+    badge = statusBadge(t("examList.status.available"), "");
+    action = `<button class="btn-primary" data-act="start" data-exam-id="${e.exam_id}">${t("examList.start")}</button>`;
+  }
+
+  const max = e.max_attempts;
+  const attemptInfo = max === 0
+    ? t("examList.unlimited")
+    : t("examList.attemptInfo", { used: e.used_attempts, max });
+
+  return html`
+    <div class="exam-card ${locked ? "locked" : ""}">
+      <div>
+        <span class="exam-icon">&#x1F4D6;</span>
+        <span class="exam-name">${escapeHtml(e.exam_name)}</span>
+      </div>
+      <div class="exam-meta">
+        <span><strong>${t("examList.paper", { title: escapeHtml(e.paper_title || "-") })}</strong></span>
+        <span><strong>${t("examList.duration", { n: e.duration_minutes })}</strong></span>
+        <span><strong>${attemptInfo}</strong></span>
+      </div>
+      <div class="exam-meta">
+        <span>${statusBadge(statusName(e.status), e.status === "running" ? "success" : e.status === "ended" ? "danger" : "")}</span>
+        ${e.last_score != null ? `<span>${t("examList.lastScore", { score: e.last_score })}</span>` : ""}
+      </div>
+      <div class="exam-actions">
+        ${badge}
+        ${action}
+      </div>
+    </div>
+  `;
+}
+
+function bindExamCardEvents() {
+  document.querySelectorAll('[data-act="start"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const examId = parseInt(btn.dataset.examId, 10);
+      await startExamFlow(examId);
+    });
+  });
+}
+
+async function startExamFlow(examId) {
+  try {
+    const data = await api("/api/exam/start", { method: "POST", body: JSON.stringify({ exam_id: examId }) });
+    state.currentExam = { id: examId };
+    state.currentRecordId = data.exam_record_id;
+    state.antiCheatBound = false; // 新一场考试重置
+    // 持久化：刷新后能从这里恢复
+    try {
+      localStorage.setItem("examInProgress", "1");
+      localStorage.setItem("activeExamId", String(examId));
+      localStorage.setItem("activeRecordId", String(data.exam_record_id));
+    } catch (e) { /* ignore */ }
+    // 立即绑定防切屏监听（无需等待用户点击确认须知）
+    bindAntiCheat();
+    // 获取考试信息用于须知页
+    const exam = (state.studentExams || []).find((e) => e.exam_id === examId);
+    state.currentExamInfo = exam;
+    if (data.is_resume) {
+      // 断点续考：直接进入答题
+      await loadPaperAndStart(examId, data.exam_record_id);
+    } else {
+      renderInstructions(examId, data.exam_record_id);
+    }
+  } catch (err) {
+    if (err.code === "NO_ATTEMPTS_LEFT") {
+      showToast(t("error.NO_ATTEMPTS_LEFT"), "error");
+    } else if (err.code === "EXAM_NOT_STARTED") {
+      showToast(t("error.EXAM_NOT_STARTED"), "warning");
+    } else {
+      showToast(err.message, "error");
+    }
+  }
+}
+
+async function loadPaperAndStart(examId, recordId) {
+  try {
+    const data = await api(`/api/exam/paper?exam_id=${examId}&record_id=${recordId}`);
+    state.examData = data;
+    state.answers = data.record.answers || {};
+    renderExam();
+    state.saveTimer = setInterval(autoSave, 30000);
+    window.addEventListener("beforeunload", autoSave);
+  } catch (err) {
+    showToast(err.message, "error");
+    if (err.code === "ALREADY_SUBMITTED") {
+      setTimeout(renderStudentExamList, 1200);
+    }
+  }
+}
+
+/* ============================================
+   考试须知
+   ============================================ */
+async function renderInstructions(examId, recordId) {
+  const exam = state.currentExamInfo || (state.studentExams || []).find((e) => e.exam_id === examId) || {};
   $app.innerHTML = html`
     <section class="login-wrap">
       <div class="instructions-card">
         <div class="instructions-header">
-          <h1>&#x1F4CB; 考试须知</h1>
+          <h1>&#x1F4CB; ${t("instructions.title")}</h1>
         </div>
         <div class="instructions-body">
           <div class="exam-info-grid">
             <div class="exam-info-item">
-              <span class="label">考试名称</span>
-              <span class="value">${data.exam.name}</span>
+              <span class="label">${t("instructions.examName")}</span>
+              <span class="value">${escapeHtml(exam.exam_name || "-")}</span>
             </div>
             <div class="exam-info-item">
-              <span class="label">考试时长</span>
-              <span class="value">${data.exam.duration_minutes} 分钟</span>
+              <span class="label">${t("instructions.examDuration")}</span>
+              <span class="value">${exam.duration_minutes || 90} ${t("common.minute")}</span>
             </div>
             <div class="exam-info-item">
-              <span class="label">试卷总分</span>
-              <span class="value">${data.paper.total_score} 分</span>
+              <span class="label">${t("instructions.totalScore")}</span>
+              <span class="value">${t("common.score", { n: "-" })}</span>
             </div>
             <div class="exam-info-item">
-              <span class="label">题目数量</span>
-              <span class="value">${data.paper.total_score > 0 ? '见试卷' : '0'} 题 (${questionTypes})</span>
+              <span class="label">${t("instructions.questionCount")}</span>
+              <span class="value">${t("common.score", { n: "-" })}</span>
             </div>
           </div>
           <div class="instructions-divider"></div>
           <div class="instructions-rules">
-            <h3>&#x26A0;&#xFE0F; 注意事项</h3>
+            <h3>&#x26A0;&#xFE0F; ${t("instructions.rules")}</h3>
             <ul class="rule-list">
-              <li>考试开始后，系统将自动倒计时，时间到自动提交试卷</li>
-              <li>系统每30秒自动保存答题进度，意外关闭浏览器可恢复</li>
-              <li>答题过程中请勿切换浏览器标签页或最小化窗口</li>
-              <li>最后5分钟系统将提示剩余时间，请合理安排答题</li>
-              <li>提交试卷前请仔细检查，提交后不可修改</li>
+              <li>${t("instructions.rule1")}</li>
+              <li>${t("instructions.rule2")}</li>
+              <li>${t("instructions.rule3")}</li>
+              <li>${t("instructions.rule4")}</li>
+              <li>${t("instructions.rule5")}</li>
             </ul>
           </div>
           <label class="checkbox-agree">
-            <input id="agree" type="checkbox" /> 我已阅读考试须知
+            <input id="agree" type="checkbox" /> ${t("instructions.agree")}
           </label>
           <div class="instructions-actions">
-            <button class="btn-primary" onclick="startStudentExam()">开始考试</button>
+            <button class="btn-primary" onclick="startStudentExam()">${t("instructions.start")}</button>
+            <button class="btn-outline" onclick="renderStudentExamList()">${t("instructions.backToList")}</button>
           </div>
           <div id="msg" class="msg"></div>
         </div>
@@ -322,19 +675,24 @@ async function renderInstructions() {
 
 async function startStudentExam() {
   if (!document.querySelector("#agree").checked) {
-    document.querySelector("#msg").textContent = "请先勾选已阅读考试须知";
+    document.querySelector("#msg").textContent = t("instructions.pleaseAgree");
     return;
   }
-  const data = await api("/api/exam/paper");
-  state.examData = data;
-  state.answers = data.record.answers || {};
-  renderExam();
-  state.saveTimer = setInterval(autoSave, 30000);
-  window.addEventListener("beforeunload", autoSave);
+  if (!state.currentRecordId || !state.currentExam) return;
+  await loadPaperAndStart(state.currentExam.id, state.currentRecordId);
 }
 
 function isAnswered(question) {
-  return String(state.answers[question.question_id] || "").trim() !== "";
+  const v = state.answers[question.question_id];
+  if (question.type === "fill_blank") {
+    let arr;
+    if (Array.isArray(v)) arr = v;
+    else if (typeof v === "string") {
+      try { arr = JSON.parse(v); } catch (e) { arr = [v]; }
+    } else arr = [];
+    return arr.some((x) => String(x || "").trim() !== "");
+  }
+  return String(v || "").trim() !== "";
 }
 
 function answeredCount() {
@@ -342,7 +700,7 @@ function answeredCount() {
 }
 
 /* ============================================
-   答题页面 - 核心页面
+   答题
    ============================================ */
 function renderExam() {
   const { exam, questions, record } = state.examData;
@@ -352,32 +710,32 @@ function renderExam() {
   $app.innerHTML = html`
     <div class="shell">
       <div class="exam-top">
-        <span class="exam-title">${exam.name}</span>
+        <span class="exam-title">${escapeHtml(exam.name)}</span>
         <div class="timer-wrap" id="timer-wrap">
           <span class="timer-icon">&#x23F0;</span>
           <span id="timer" class="timer">--:--:--</span>
         </div>
-        <span class="student-info">考生: ${state.student.name} (${state.student.student_id})</span>
-        <button class="btn-danger" onclick="submitExam(false)">交 卷</button>
+        <span class="student-info">${t("exam.title")}: ${state.student ? state.student.name : ""} (${state.student ? state.student.student_id : ""})</span>
+        <button class="btn-danger" onclick="submitExam(false)">${t("exam.submit")}</button>
+        <button class="btn-outline btn-sm" onclick="backToListConfirm()">&#x2190;</button>
       </div>
       <div class="exam-layout">
         <aside class="question-nav">
-          <h3>题目导航</h3>
+          <h3>${t("exam.qNav")}</h3>
           <div class="q-buttons">
             ${questions
-              .map(
-                (q, i) =>
-                  `<button class="qbtn ${isAnswered(q) ? "done" : ""} ${i === state.currentQuestion ? "current" : ""}" onclick="jumpQuestion(${i})">${q.question_no}</button>`
+              .map((q, i) =>
+                `<button class="qbtn ${isAnswered(q) ? "done" : ""} ${i === state.currentQuestion ? "current" : ""}" onclick="jumpQuestion(${i})">${q.question_no}</button>`
               )
               .join("")}
           </div>
           <div class="nav-legend">
-            <div class="legend-item"><span class="legend-dot done"></span>已作答</div>
-            <div class="legend-item"><span class="legend-dot unanswered"></span>未作答</div>
-            <div class="legend-item"><span class="legend-dot current"></span>当前题目</div>
+            <div class="legend-item"><span class="legend-dot done"></span>${t("exam.legendDone")}</div>
+            <div class="legend-item"><span class="legend-dot unanswered"></span>${t("exam.legendUndone")}</div>
+            <div class="legend-item"><span class="legend-dot current"></span>${t("exam.legendCurrent")}</div>
           </div>
           <div class="progress-section">
-            <p class="progress-label">答题进度</p>
+            <p class="progress-label">${t("exam.progress")}</p>
             <div class="progress"><span style="width:${percent}%"></span></div>
             <p class="progress-text">${answeredCount()} / ${questions.length}</p>
           </div>
@@ -390,50 +748,121 @@ function renderExam() {
   `;
   updateTimer(end);
   state.countdown = setInterval(() => updateTimer(end), 1000);
+  bindAntiCheat();
+}
+
+function bindAntiCheat() {
+  // 防切屏：visibilitychange 事件 + blur 兜底
+  const recordId = state.currentRecordId;
+  if (!recordId) return;
+  if (state.antiCheatBound) return;
+  state.antiCheatBound = true;
+  state.tabSwitchCount = 0;
+
+  const reportSwitch = async () => {
+    if (!state.currentRecordId) return;
+    if (state.tabSwitchProcessing) return;
+    state.tabSwitchProcessing = true;
+    try {
+      const data = await api("/api/exam/tab-switch", {
+        method: "POST",
+        body: JSON.stringify({ record_id: state.currentRecordId }),
+      });
+      state.tabSwitchCount = (data && data.count) || 0;
+      const limit = (data && data.limit) || 3;
+      if (data && data.force_submitted) {
+        showToast(t("exam.tabSwitch.violation", { count: state.tabSwitchCount }), "error", 8000);
+        // 强制退出答题页 → 回到试卷选择列表
+        forceExitToExamList();
+      } else {
+        showToast(t("exam.tabSwitch.warn", { count: state.tabSwitchCount, limit }), "warning", 5000);
+      }
+    } catch (err) {
+      // 静默失败
+    } finally {
+      state.tabSwitchProcessing = false;
+    }
+  };
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && state.currentRecordId) reportSwitch();
+  });
+  window.addEventListener("blur", () => {
+    if (state.currentRecordId) reportSwitch();
+  });
 }
 
 function renderQuestion(q, index) {
-  const label = { single_choice: "单选题", multiple_choice: "多选题", true_false: "判断题", short_answer: "简答题" }[q.type];
+  const label = questionTypeName(q.type);
   return html`
     <section id="q${index}" class="panel question">
       <div class="question-header">
-        <span class="question-no">第 ${q.question_no} 题</span>
+        <span class="question-no">${t("common.question", { no: q.question_no })}</span>
         <span class="question-type-tag">${label}</span>
-        <span class="question-score">${q.score}分</span>
+        <span class="question-score">${t("common.score", { n: q.score })}</span>
       </div>
-      <p class="question-content">${q.content}</p>
+      <p class="question-content">${escapeHtml(q.content)}</p>
       ${renderAnswerControl(q)}
       <div class="question-actions">
-        <button class="btn-outline" onclick="jumpQuestion(${Math.max(0, index - 1)})">&#x2190; 上一题</button>
-        <button class="btn-primary" onclick="jumpQuestion(${Math.min(state.examData.questions.length - 1, index + 1)})">下一题 &#x2192;</button>
-        <span class="save-status">&#x2713; 已自动保存</span>
+        <button class="btn-outline" onclick="jumpQuestion(${Math.max(0, index - 1)})">&#x2190; ${t("common.previous")}</button>
+        <button class="btn-primary" onclick="jumpQuestion(${Math.min(state.examData.questions.length - 1, index + 1)})">${t("common.next")} &#x2192;</button>
+        <span class="save-status">&#x2713; ${t("exam.saved")}</span>
       </div>
     </section>
   `;
 }
 
 function renderAnswerControl(q) {
-  const current = state.answers[q.question_id] || "";
+  const raw = state.answers[q.question_id];
+  if (q.type === "fill_blank") {
+    let arr;
+    if (Array.isArray(raw)) arr = raw;
+    else if (typeof raw === "string") {
+      try { arr = JSON.parse(raw); } catch (e) { arr = [raw]; }
+    } else arr = [];
+    const blanks = (q.content || "").split("__");
+    const parts = [];
+    for (let i = 0; i < blanks.length - 1; i++) {
+      parts.push(`<span>${escapeHtml(blanks[i])}</span>`);
+      parts.push(`<input class="blank-input" data-blank-idx="${i}" data-qid="${q.question_id}" value="${escapeHtml(arr[i] || "")}" placeholder="${t("exam.fillBlankPlaceholder")}" />`);
+    }
+    parts.push(`<span>${escapeHtml(blanks[blanks.length - 1])}</span>`);
+    setTimeout(() => bindFillBlankEvents(q.question_id), 0);
+    return `<div class="fill-blank-group">${parts.join("")}</div>
+      <p style="font-size:12px;color:var(--text-secondary);margin-top:6px">${t("exam.fillBlankHint")}</p>`;
+  }
   if (q.type === "short_answer") {
-    return `<textarea oninput="setAnswer('${q.question_id}', this.value)" placeholder="请输入您的答案...">${current}</textarea>`;
+    return `<textarea oninput="setAnswer('${q.question_id}', this.value)" placeholder="...">${escapeHtml(raw || "")}</textarea>`;
   }
   if (q.type === "true_false") {
     return `
-      <label class="option ${current === 'true' ? 'selected' : ''}"><input type="radio" name="q${q.question_id}" ${current === "true" ? "checked" : ""} onchange="setAnswer('${q.question_id}', 'true')" /> <span>正确</span></label>
-      <label class="option ${current === 'false' ? 'selected' : ''}"><input type="radio" name="q${q.question_id}" ${current === "false" ? "checked" : ""} onchange="setAnswer('${q.question_id}', 'false')" /> <span>错误</span></label>
+      <label class="option ${raw === 'true' ? 'selected' : ''}"><input type="radio" name="q${q.question_id}" ${raw === "true" ? "checked" : ""} onchange="setAnswer('${q.question_id}', 'true')" /> <span>${t("option.true")}</span></label>
+      <label class="option ${raw === 'false' ? 'selected' : ''}"><input type="radio" name="q${q.question_id}" ${raw === "false" ? "checked" : ""} onchange="setAnswer('${q.question_id}', 'false')" /> <span>${t("option.false")}</span></label>
     `;
   }
   const multiple = q.type === "multiple_choice";
-  const selected = current ? current.split(",") : [];
-  return q.options
+  const selected = raw ? String(raw).split(",") : [];
+  return (q.options || [])
     .map(
       (opt) => `
       <label class="option ${selected.includes(opt.key) ? 'selected' : ''}">
         <input type="${multiple ? "checkbox" : "radio"}" name="q${q.question_id}" value="${opt.key}" ${selected.includes(opt.key) ? "checked" : ""} onchange="setChoice('${q.question_id}', '${q.type}')" />
-        <span>${opt.key}. ${opt.value}</span>
+        <span>${opt.key}. ${escapeHtml(opt.value)}</span>
       </label>`
     )
     .join("");
+}
+
+function bindFillBlankEvents(questionId) {
+  const inputs = document.querySelectorAll(`.blank-input[data-qid="${questionId}"]`);
+  inputs.forEach((inp) => {
+    inp.addEventListener("input", () => {
+      const arr = Array.from(document.querySelectorAll(`.blank-input[data-qid="${questionId}"]`))
+        .map((i) => i.value);
+      state.answers[questionId] = arr;
+      refreshNavOnly();
+    });
+  });
 }
 
 function setAnswer(questionId, value) {
@@ -473,7 +902,6 @@ function updateTimer(end) {
   if (!timer) return;
   timer.textContent = `${h}:${m}:${s}`;
   const isDanger = total <= 300;
-  timerWrap.classList.toggle("timer-wrap", !isDanger);
   timerWrap.style.background = isDanger ? '#FEF0F0' : '';
   timerWrap.style.borderColor = isDanger ? '#FDE2E2' : '';
   timer.classList.toggle("danger-time", isDanger);
@@ -481,30 +909,75 @@ function updateTimer(end) {
 }
 
 async function autoSave() {
-  if (!state.examData) return;
-  await api("/api/exam/auto-save", { method: "POST", body: JSON.stringify({ answers: state.answers }) }).catch(() => {});
+  if (!state.examData || !state.currentRecordId) return;
+  await api("/api/exam/auto-save", {
+    method: "POST",
+    body: JSON.stringify({ record_id: state.currentRecordId, answers: state.answers }),
+  }).catch(() => {});
+}
+
+function backToListConfirm() {
+  showModal({
+    icon: "&#x26A0;&#xFE0F;",
+    title: t("instructions.backToList"),
+    message: t("instructions.pleaseAgree"),
+    confirmText: t("common.confirm"),
+    cancelText: t("common.cancel"),
+    onConfirm: () => {
+      clearTimers();
+      renderStudentExamList();
+    },
+  });
+}
+
+/**
+ * 强制退出答题页（被防切屏超限、异常中断等情况调用）
+ *  - 清理倒计时 / 自动保存
+ *  - 解除防切屏监听
+ *  - 持久化清理，避免刷新后误入答题页
+ *  - 回到试卷选择列表
+ */
+function forceExitToExamList() {
+  clearTimers();
+  if (state.antiCheatBound) {
+    state.antiCheatBound = false;
+    state.tabSwitchCount = 0;
+  }
+  state.examData = null;
+  state.currentRecordId = null;
+  state.currentExam = null;
+  state.currentExamInfo = null;
+  state.answers = {};
+  state.currentQuestion = 0;
+  // 清理持久化状态
+  try {
+    localStorage.removeItem("examInProgress");
+    localStorage.removeItem("activeRecordId");
+    localStorage.removeItem("activeExamId");
+  } catch (e) { /* ignore */ }
+  setTimeout(() => {
+    renderStudentExamList();
+  }, 1500);
 }
 
 async function submitExam(auto) {
+  if (!state.examData || !state.currentRecordId) return;
   if (!auto) {
     const total = state.examData.questions.length;
     const left = total - answeredCount();
     if (left === 0) {
-      // 全部答完：直接提交，使用toast提示
       await doSubmit();
-      showToast("已全部作答，正在提交答卷...", "success");
+      showToast(t("exam.autoSubmit"), "success");
       return;
     }
-    // 有未答题：使用自定义弹窗
     showModal({
       icon: "&#x26A0;&#xFE0F;",
-      title: "确认交卷",
-      message: `您还有 <strong style="color:var(--danger)">${left}</strong> 道题未作答（${answeredCount()}/${total}），确认要交卷吗？`,
-      confirmText: "确认交卷",
-      cancelText: "继续答题",
-      onConfirm: async () => {
-        await doSubmit();
-      },
+      title: t("exam.submitConfirmTitle"),
+      message: t("exam.submitConfirmMsg", { left, done: answeredCount(), total }),
+      confirmText: t("exam.confirmSubmit"),
+      cancelText: t("exam.continueAnswering"),
+      danger: true,
+      onConfirm: async () => { await doSubmit(); },
     });
     return;
   }
@@ -512,87 +985,134 @@ async function submitExam(auto) {
 }
 
 async function doSubmit() {
-  clearInterval(state.saveTimer);
-  clearInterval(state.countdown);
-  await api("/api/exam/submit", { method: "POST", body: JSON.stringify({ answers: state.answers }) });
-  renderSubmitted();
+  clearTimers();
+  try {
+    await api("/api/exam/submit", {
+      method: "POST",
+      body: JSON.stringify({ record_id: state.currentRecordId, answers: state.answers }),
+    });
+    renderSubmitted();
+  } catch (err) {
+    showToast(err.message, "error");
+  }
 }
 
-/* ============================================
-   提交成功页
-   ============================================ */
 function renderSubmitted() {
   const now = new Date();
   const timeStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-  const examName = state.examData ? state.examData.exam.name : '考试';
+  const examName = state.examData ? state.examData.exam.name : '';
   $app.innerHTML = html`
     <section class="login-wrap">
       <div class="success-card">
         <div class="success-icon">&#x2713;</div>
-        <h1>试卷提交成功</h1>
-        <p class="desc">您的答卷已成功提交，请耐心等待成绩公布</p>
+        <h1>${t("submitted.title")}</h1>
+        <p class="desc">${t("submitted.desc")}</p>
         <div class="success-info">
           <div class="info-row">
-            <span class="info-label">考试名称</span>
-            <span class="info-value">${examName}</span>
+            <span class="info-label">${t("submitted.examName")}</span>
+            <span class="info-value">${escapeHtml(examName)}</span>
           </div>
           <div class="info-row">
-            <span class="info-label">提交时间</span>
+            <span class="info-label">${t("submitted.time")}</span>
             <span class="info-value">${timeStr}</span>
           </div>
         </div>
-        <button class="btn-primary" onclick="logout()">关闭页面</button>
+        <button class="btn-primary" onclick="renderStudentExamList()">${t("submitted.backToList")}</button>
       </div>
     </section>
   `;
+  // 清空状态
+  state.examData = null;
+  state.answers = {};
+  state.currentRecordId = null;
+  state.currentExam = null;
+  // 重新拉取考试列表，更新状态
+  setTimeout(() => { state.studentExams = []; }, 0);
 }
 
 /* ============================================
    教师端布局
    ============================================ */
 function renderTeacher() {
-  clearInterval(state.monitorTimer);
+  clearTimers();
   clearCharts();
   const tabs = [
-    ["dashboard", "&#x1F4CA;", "仪表盘"],
-    ["students", "&#x1F465;", "学生管理"],
-    ["papers", "&#x1F4D3;", "试卷管理"],
-    ["exam", "&#x1F4DD;", "考试管理"],
-    ["monitor", "&#x1F4F9;", "实时监控"],
-    ["grading", "&#x270D;", "批改评分"],
-    ["results", "&#x1F4CB;", "成绩管理"],
+    ["dashboard", "&#x1F4CA;", "nav.dashboard"],
+    ["students", "&#x1F465;", "nav.students"],
+    ["papers", "&#x1F4D3;", "nav.papers"],
+    ["exam", "&#x1F4DD;", "nav.exam"],
+    ["monitor", "&#x1F4F9;", "nav.monitor"],
+    ["grading", "&#x270D;", "nav.grading"],
+    ["results", "&#x1F4CB;", "nav.results"],
   ];
   $app.innerHTML = html`
     <div class="shell">
       <header class="topbar">
         <span class="brand">
           <span class="brand-logo">LAN<br/>EXAM</span>
-          局域网考试系统教师端
+          ${t("login.welcome")}
         </span>
         <span class="topbar-right">
-          <span>欢迎, 管理员</span>
-          <button class="btn-outline btn-sm" onclick="logout()">退出登录</button>
+          ${langSwitcher()}
+          <span>${t("nav.dashboard")}</span>
+          <button class="btn-outline btn-sm" onclick="logout()">${t("nav.logout")}</button>
         </span>
       </header>
       <div class="layout">
         <aside class="sidebar">
           <div class="sidebar-logo"><span>LAN Exam System</span></div>
-          ${tabs.map(([id, icon, name]) => `<button class="sidebtn ${state.teacherTab === id ? "active" : ""}" onclick="setTeacherTab('${id}')">${icon}  ${name}</button>`).join("")}
+          ${tabs.map(([id, icon, key]) => `<button class="sidebtn ${state.teacherTab === id ? "active" : ""}" onclick="setTeacherTab('${id}')">${icon}  ${t(key)}</button>`).join("")}
         </aside>
         <main id="teacher-main" class="main"></main>
       </div>
     </div>
   `;
+  bindLangSwitcher();
   renderTeacherTab();
 }
 
 function setTeacherTab(tab) {
   state.teacherTab = tab;
+  try { localStorage.setItem("teacherTab", tab); } catch (e) { /* ignore */ }
+  // 切到非监控/成绩/批改页时清理对应 ID
+  if (tab !== "monitor") {
+    try { localStorage.removeItem("monitorExamId"); } catch (e) { /* ignore */ }
+  }
+  if (tab !== "results") {
+    try { localStorage.removeItem("resultsExamId"); } catch (e) { /* ignore */ }
+  }
+  if (tab !== "grading") {
+    try { localStorage.removeItem("gradingExamId"); } catch (e) { /* ignore */ }
+  }
   renderTeacher();
+}
+
+/** 设置当前监考/成绩/批改的考试 id，同时持久化。 */
+function setMonitorExamId(id) {
+  state.monitorExamId = id;
+  try {
+    if (id == null) localStorage.removeItem("monitorExamId");
+    else localStorage.setItem("monitorExamId", String(id));
+  } catch (e) { /* ignore */ }
+}
+function setResultsExamId(id) {
+  state.resultsExamId = id;
+  try {
+    if (id == null) localStorage.removeItem("resultsExamId");
+    else localStorage.setItem("resultsExamId", String(id));
+  } catch (e) { /* ignore */ }
+}
+function setGradingExamId(id) {
+  state.grading.examId = id;
+  try {
+    if (id == null) localStorage.removeItem("gradingExamId");
+    else localStorage.setItem("gradingExamId", JSON.stringify({ examId: id }));
+  } catch (e) { /* ignore */ }
 }
 
 async function renderTeacherTab() {
   const main = document.querySelector("#teacher-main");
+  if (!main) return;
   if (state.teacherTab === "dashboard") return renderDashboard(main);
   if (state.teacherTab === "students") return renderStudents(main);
   if (state.teacherTab === "papers") return renderPapers(main);
@@ -603,62 +1123,72 @@ async function renderTeacherTab() {
 }
 
 /* ============================================
-   仪表盘 - ECharts 数据可视化
+   仪表盘
    ============================================ */
 async function renderDashboard(main) {
   clearCharts();
-  const [exam, monitor, dashboard] = await Promise.all([
-    api("/api/exam/current"),
-    api("/api/teacher/monitor"),
-    api("/api/teacher/dashboard"),
-  ]);
+  let exam, monitor, dashboard;
+  try {
+    [exam, monitor, dashboard] = await Promise.all([
+      api("/api/exam/current").catch(() => null),
+      api("/api/teacher/monitor").catch((e) => { showToast(e.message, "error"); return null; }),
+      api("/api/teacher/dashboard").catch((e) => { showToast(e.message, "error"); return null; }),
+    ]);
+  } catch (err) {
+    showToast(err.message, "error");
+    return;
+  }
+  if (!exam || !monitor || !dashboard) {
+    main.innerHTML = `<div class="panel" style="text-align:center;color:var(--text-secondary)">${t("common.empty")}</div>`;
+    return;
+  }
   const statusText = statusName(exam.exam.status);
   main.innerHTML = html`
     <div class="page-header">
-      <h2>仪表盘</h2>
-      <span class="hint">${exam.exam.name} · ${statusText}</span>
+      <h2>${t("dashboard.title")}</h2>
+      <span class="hint">${escapeHtml(exam.exam.name)} · ${statusText}</span>
     </div>
     <div class="dashboard-summary">
       <div class="stat-card" style="--stat-color: #4A90D9">
-        <div class="stat-label">学生总数</div>
+        <div class="stat-label">${t("dashboard.students")}</div>
         <div class="stat-value">${dashboard.totals.students}</div>
-        <div class="stat-extra">已登录 ${monitor.stats.logged_in} 人</div>
+        <div class="stat-extra">${t("dashboard.loggedIn", { n: monitor.stats.logged_in })}</div>
       </div>
       <div class="stat-card" style="--stat-color: #67C23A">
-        <div class="stat-label">答题中</div>
+        <div class="stat-label">${t("dashboard.answering")}</div>
         <div class="stat-value">${monitor.stats.answering}</div>
-        <div class="stat-extra">实时进行</div>
+        <div class="stat-extra">${t("dashboard.realtime")}</div>
       </div>
       <div class="stat-card" style="--stat-color: #E6A23C">
-        <div class="stat-label">已提交</div>
+        <div class="stat-label">${t("dashboard.submitted")}</div>
         <div class="stat-value">${monitor.stats.submitted}</div>
-        <div class="stat-extra">含强制收卷</div>
+        <div class="stat-extra">${t("status.forced")}</div>
       </div>
       <div class="stat-card" style="--stat-color: #F56C6C">
-        <div class="stat-label">题目总数</div>
+        <div class="stat-label">${t("dashboard.questions")}</div>
         <div class="stat-value">${dashboard.totals.questions}</div>
       </div>
     </div>
     <div class="chart-grid">
       <div class="chart-card">
         <div class="chart-header">
-          <span class="chart-title">&#x1F4CA; 学生状态分布</span>
-          <span class="chart-desc">实时</span>
+          <span class="chart-title">&#x1F4CA; ${t("dashboard.statusChart")}</span>
+          <span class="chart-desc">${t("dashboard.realtime")}</span>
         </div>
         <div id="chart-status" class="chart-container"></div>
       </div>
       <div class="chart-card">
         <div class="chart-header">
-          <span class="chart-title">&#x1F4DD; 答题进度分布</span>
-          <span class="chart-desc">实时</span>
+          <span class="chart-title">&#x1F4DD; ${t("dashboard.progressChart")}</span>
+          <span class="chart-desc">${t("dashboard.realtime")}</span>
         </div>
         <div id="chart-progress" class="chart-container"></div>
       </div>
     </div>
     <div class="chart-card">
       <div class="chart-header">
-        <span class="chart-title">&#x1F4C8; 成绩分数段分布</span>
-        <span class="chart-desc">${exam.exam.name}</span>
+        <span class="chart-title">&#x1F4C8; ${t("dashboard.scoreChart")}</span>
+        <span class="chart-desc">${escapeHtml(exam.exam.name)}</span>
       </div>
       <div id="chart-score" class="chart-container chart-large"></div>
     </div>
@@ -666,8 +1196,6 @@ async function renderDashboard(main) {
   renderStatusChart(dashboard.status_distribution);
   renderProgressChart(dashboard.answered_distribution);
   renderScoreChart(dashboard.score_distribution);
-
-  // 自适应窗口大小
   if (!state._resizeHandler) {
     state._resizeHandler = () => state.chartInstances.forEach((c) => c && c.resize && c.resize());
     window.addEventListener("resize", state._resizeHandler);
@@ -679,23 +1207,22 @@ function renderStatusChart(data) {
   if (!el) return;
   const chart = echarts.init(el);
   const colorMap = {
-    "未登录": "#909399",
-    "已登录": "#E6A23C",
-    "答题中": "#67C23A",
-    "已提交": "#4A90D9",
-    "已强制收卷": "#F56C6C",
+    "not_logged_in": "#909399", "logged_in": "#E6A23C", "answering": "#67C23A",
+    "submitted": "#4A90D9", "forced": "#F56C6C",
   };
-  const items = Object.keys(data).map((k) => ({ name: k, value: data[k], itemStyle: { color: colorMap[k] } }));
+  const items = Object.keys(data).map((k) => ({
+    name: t(`status.${k}`),
+    value: data[k],
+    itemStyle: { color: colorMap[k] || "#909399" },
+  }));
   chart.setOption({
-    tooltip: { trigger: "item", formatter: "{b}: {c} 人 ({d}%)" },
+    tooltip: { trigger: "item", formatter: "{b}: {c} ({d}%)" },
     legend: { bottom: 0, textStyle: { fontSize: 12, color: "#606266" } },
     series: [{
-      type: "pie",
-      radius: ["45%", "70%"],
-      center: ["50%", "45%"],
+      type: "pie", radius: ["45%", "70%"], center: ["50%", "45%"],
       avoidLabelOverlap: true,
       itemStyle: { borderRadius: 6, borderColor: "#fff", borderWidth: 2 },
-      label: { show: true, formatter: "{b}\n{c}人", fontSize: 12, color: "#303133" },
+      label: { show: true, formatter: "{b}\n{c}", fontSize: 12, color: "#303133" },
       labelLine: { show: true },
       data: items,
     }],
@@ -709,34 +1236,23 @@ function renderProgressChart(data) {
   const chart = echarts.init(el);
   const keys = Object.keys(data);
   const values = keys.map((k) => data[k]);
+  const labelMap = {
+    "0": t("dashboard.progress.0"),
+    "1-3": t("dashboard.progress.1to3"),
+    "4-6": t("dashboard.progress.4to6"),
+    "all": t("dashboard.progress.all"),
+  };
+  const labels = keys.map((k) => labelMap[k] || k);
   chart.setOption({
     tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
     grid: { left: "5%", right: "5%", bottom: "8%", top: "12%", containLabel: true },
-    xAxis: {
-      type: "category",
-      data: keys,
-      axisLine: { lineStyle: { color: "#DCDFE6" } },
-      axisLabel: { color: "#606266", fontSize: 12 },
-    },
-    yAxis: {
-      type: "value",
-      axisLine: { show: false },
-      axisTick: { show: false },
-      splitLine: { lineStyle: { color: "#EBEEF5" } },
-      axisLabel: { color: "#909399", fontSize: 12 },
-    },
+    xAxis: { type: "category", data: labels, axisLine: { lineStyle: { color: "#DCDFE6" } }, axisLabel: { color: "#606266", fontSize: 12 } },
+    yAxis: { type: "value", axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: "#EBEEF5" } }, axisLabel: { color: "#909399", fontSize: 12 } },
     series: [{
-      data: values,
-      type: "bar",
-      barWidth: "50%",
+      data: values, type: "bar", barWidth: "50%",
       itemStyle: {
-        color: {
-          type: "linear", x: 0, y: 0, x2: 0, y2: 1,
-          colorStops: [
-            { offset: 0, color: "#5a9ee0" },
-            { offset: 1, color: "#357ABD" },
-          ],
-        },
+        color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1,
+          colorStops: [{ offset: 0, color: "#5a9ee0" }, { offset: 1, color: "#357ABD" }] },
         borderRadius: [6, 6, 0, 0],
       },
       label: { show: true, position: "top", color: "#606266", fontSize: 12 },
@@ -754,27 +1270,13 @@ function renderScoreChart(data) {
   const total = values.reduce((a, b) => a + b, 0);
   const colorList = ["#F56C6C", "#E6A23C", "#909399", "#4A90D9", "#67C23A"];
   chart.setOption({
-    tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, formatter: (p) => `${p[0].name}<br/>人数: ${p[0].value} (${total ? ((p[0].value/total)*100).toFixed(1) : 0}%)` },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" }, formatter: (p) => `${p[0].name}<br/>${p[0].value} (${total ? ((p[0].value/total)*100).toFixed(1) : 0}%)` },
     grid: { left: "3%", right: "4%", bottom: "6%", top: "10%", containLabel: true },
-    xAxis: {
-      type: "category",
-      data: keys,
-      axisLine: { lineStyle: { color: "#DCDFE6" } },
-      axisLabel: { color: "#606266", fontSize: 12 },
-    },
-    yAxis: {
-      type: "value",
-      name: "人数",
-      nameTextStyle: { color: "#909399", fontSize: 12 },
-      axisLine: { show: false },
-      axisTick: { show: false },
-      splitLine: { lineStyle: { color: "#EBEEF5" } },
-      axisLabel: { color: "#909399", fontSize: 12 },
-    },
+    xAxis: { type: "category", data: keys, axisLine: { lineStyle: { color: "#DCDFE6" } }, axisLabel: { color: "#606266", fontSize: 12 } },
+    yAxis: { type: "value", axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: "#EBEEF5" } }, axisLabel: { color: "#909399", fontSize: 12 } },
     series: [{
       data: values.map((v, i) => ({ value: v, itemStyle: { color: colorList[i], borderRadius: [6, 6, 0, 0] } })),
-      type: "bar",
-      barWidth: "45%",
+      type: "bar", barWidth: "45%",
       label: { show: true, position: "top", color: "#606266", fontSize: 12 },
     }],
   });
@@ -785,47 +1287,51 @@ function renderScoreChart(data) {
    学生管理
    ============================================ */
 async function renderStudents(main) {
-  const rows = await api("/api/students");
-  main.innerHTML = html`
-    <div class="page-header">
-      <h2>学生管理</h2>
-      <div class="actions">
-        <button class="btn-success" onclick="openImportStudentsModal()">&#x1F4E5; 导入学生</button>
-        <button class="btn-outline" onclick="downloadStudentTemplate()">&#x1F4C4; 下载模板</button>
+  try {
+    const rows = await api("/api/students");
+    main.innerHTML = html`
+      <div class="page-header">
+        <h2>${t("students.title")}</h2>
+        <div class="actions">
+          <button class="btn-success" onclick="openImportStudentsModal()">&#x1F4E5; ${t("students.importBtn")}</button>
+          <button class="btn-outline" onclick="downloadStudentTemplate()">&#x1F4C4; ${t("students.templateBtn")}</button>
+        </div>
       </div>
-    </div>
-    <div class="panel">
-      <h3>账号规则说明</h3>
-      <ul class="rule-list">
-        <li>导入学生后系统自动创建账号，账号为<strong>学号</strong>，初始密码为<strong>学号后5位</strong></li>
-        <li>支持从 Excel 文件批量导入，列依次为：<strong>学号 / 姓名 / 班级</strong></li>
-        <li>重复导入同一学号将自动更新姓名、班级、密码</li>
-      </ul>
-    </div>
-    <div class="table-wrap">
-      <div class="table-header">
-        <h3>学生列表</h3>
-        <span class="hint">共 ${rows.length} 名学生</span>
+      <div class="panel">
+        <h3>${t("students.rulesTitle")}</h3>
+        <ul class="rule-list">
+          <li>${t("students.rule1")}</li>
+          <li>${t("students.rule2")}</li>
+          <li>${t("students.rule3")}</li>
+        </ul>
       </div>
-      <table>
-        <thead>
-          <tr><th>学号</th><th>姓名</th><th>班级</th><th>账号</th><th>初始密码</th></tr>
-        </thead>
-        <tbody>
-          ${rows.length === 0 ? '<tr><td colspan="5" class="table-empty">暂无学生，请先导入</td></tr>' :
-            rows.map((r) => `
-              <tr>
-                <td style="color:var(--primary);font-weight:600">${r.student_id}</td>
-                <td>${r.name}</td>
-                <td>${r.class_name}</td>
-                <td><code>${r.student_id}</code></td>
-                <td><code>${r.student_id.slice(-5)}</code></td>
-              </tr>
-            `).join("")}
-        </tbody>
-      </table>
-    </div>
-  `;
+      <div class="table-wrap">
+        <div class="table-header">
+          <h3>${t("students.listTitle")}</h3>
+          <span class="hint">${t("students.total", { n: rows.length })}</span>
+        </div>
+        <table>
+          <thead>
+            <tr><th>${t("students.colId")}</th><th>${t("students.colName")}</th><th>${t("students.colClass")}</th><th>${t("students.colAccount")}</th><th>${t("students.colInitialPwd")}</th></tr>
+          </thead>
+          <tbody>
+            ${rows.length === 0 ? `<tr><td colspan="5" class="table-empty">${t("students.empty")}</td></tr>` :
+              rows.map((r) => `
+                <tr>
+                  <td style="color:var(--primary);font-weight:600">${r.student_id}</td>
+                  <td>${escapeHtml(r.name)}</td>
+                  <td>${escapeHtml(r.class_name)}</td>
+                  <td><code>${r.student_id}</code></td>
+                  <td><code>${String(r.student_id).slice(-5)}</code></td>
+                </tr>
+              `).join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (err) {
+    showToast(err.message, "error");
+  }
 }
 
 function openImportStudentsModal() {
@@ -834,28 +1340,23 @@ function openImportStudentsModal() {
   overlay.innerHTML = html`
     <div class="modal-form">
       <div class="modal-form-header">
-        <h3>&#x1F4E5; 导入学生名单</h3>
+        <h3>&#x1F4E5; ${t("students.modalTitle")}</h3>
         <button type="button" class="close-btn" data-act="close">&#x2715;</button>
       </div>
       <label class="upload-zone" id="upload-zone">
         <div class="upload-icon">&#x1F4C2;</div>
-        <div class="upload-text">点击此处选择 Excel 文件，或拖拽到此处</div>
-        <div class="upload-hint">支持 .xlsx / .xls 格式，第一行为表头</div>
+        <div class="upload-text">${t("students.modalHint")}</div>
+        <div class="upload-hint">.xlsx / .xls / .csv</div>
         <div class="file-name" id="file-name" style="display:none"></div>
-        <input type="file" id="file-input" accept=".xlsx,.xls" />
+        <input type="file" id="file-input" accept=".xlsx,.xls,.csv" />
       </label>
-      <div class="field-hint">
-        <strong>Excel 列顺序：</strong>学号 | 姓名 | 班级<br/>
-        <strong>示例：</strong><br/>
-        2024100101 | 张三 | 24移动互联3-1<br/>
-        2024100102 | 李四 | 24移动互联3-1
-      </div>
+      <div class="field-hint"><strong>${t("students.modalExcelCols")}</strong></div>
       <div class="import-template-link" style="margin-top:12px" onclick="downloadStudentTemplate()">
-        &#x1F4C4; 没有模板？点击下载导入模板
+        &#x1F4C4; ${t("students.templateBtn")}
       </div>
       <div class="form-actions">
-        <button type="button" class="btn-outline" data-act="close">取消</button>
-        <button type="button" class="btn-primary" id="confirm-import" disabled onclick="confirmImportStudents()">开始导入</button>
+        <button type="button" class="btn-outline" data-act="close">${t("common.cancel")}</button>
+        <button type="button" class="btn-primary" id="confirm-import" disabled onclick="confirmImportStudents()">${t("common.import")}</button>
       </div>
     </div>
   `;
@@ -865,7 +1366,6 @@ function openImportStudentsModal() {
     if (e.target === overlay) close();
     if (e.target.dataset.act === "close" || e.target.closest('[data-act="close"]')) close();
   });
-  // 文件选择
   const fileInput = overlay.querySelector("#file-input");
   const fileName = overlay.querySelector("#file-name");
   const confirmBtn = overlay.querySelector("#confirm-import");
@@ -873,16 +1373,12 @@ function openImportStudentsModal() {
   fileInput.addEventListener("change", () => {
     if (fileInput.files.length) {
       const f = fileInput.files[0];
-      fileName.textContent = `已选择: ${f.name} (${(f.size/1024).toFixed(1)} KB)`;
+      fileName.textContent = `${f.name} (${(f.size/1024).toFixed(1)} KB)`;
       fileName.style.display = "block";
       confirmBtn.disabled = false;
     }
   });
-  // 拖拽支持
-  uploadZone.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    uploadZone.classList.add("drag-over");
-  });
+  uploadZone.addEventListener("dragover", (e) => { e.preventDefault(); uploadZone.classList.add("drag-over"); });
   uploadZone.addEventListener("dragleave", () => uploadZone.classList.remove("drag-over"));
   uploadZone.addEventListener("drop", (e) => {
     e.preventDefault();
@@ -896,79 +1392,103 @@ function openImportStudentsModal() {
 
 async function confirmImportStudents() {
   const fileInput = document.querySelector("#file-input");
-  if (!fileInput || !fileInput.files.length) {
-    showToast("请先选择文件", "error");
-    return;
-  }
+  if (!fileInput || !fileInput.files.length) { showToast(t("error.FILE_REQUIRED"), "error"); return; }
   const formData = new FormData();
   formData.append("file", fileInput.files[0]);
   const overlay = document.querySelector(".modal-overlay");
   const confirmBtn = document.querySelector("#confirm-import");
   confirmBtn.disabled = true;
-  confirmBtn.textContent = "导入中...";
+  confirmBtn.textContent = t("common.loading");
   try {
     const headers = {};
     if (state.token) headers.Authorization = `Bearer ${state.token}`;
     const res = await fetch("/api/students/import", { method: "POST", body: formData, headers });
     const body = await res.json();
-    if (!res.ok || body.code !== 200) throw new Error(body.message || "导入失败");
+    if (!res.ok || body.code !== 200) throw new Error(translateError(body.message));
     overlay.remove();
-    showToast(`成功导入 ${body.data.count} 名学生`, "success");
+    showToast(t("students.imported", { n: body.data.count }), "success");
     renderTeacher();
   } catch (err) {
     showToast(err.message, "error");
     confirmBtn.disabled = false;
-    confirmBtn.textContent = "开始导入";
+    confirmBtn.textContent = t("common.import");
   }
 }
 
 function downloadStudentTemplate() {
-  const csv = "\uFEFF学号,姓名,班级\n2024100101,张三,24移动互联3-1\n2024100102,李四,24移动互联3-1\n2024100103,王五,24移动互联3-2\n";
+  const csv = "\uFEFF" + t("students.colId") + "," + t("students.colName") + "," + t("students.colClass") + "\n"
+    + "2024100101,Tom,Class-3-1\n2024100102,Jerry,Class-3-1\n2024100103,Anna,Class-3-2\n";
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "学生名单模板.csv";
+  a.download = "student_template.csv";
   a.click();
   URL.revokeObjectURL(url);
-  showToast("模板下载完成", "success");
+  showToast(t("students.templateDownloaded"), "success");
 }
 
 /* ============================================
    试卷管理
    ============================================ */
 async function renderPapers(main) {
-  const rows = await api("/api/papers");
-  main.innerHTML = html`
-    <div class="page-header">
-      <h2>试卷管理</h2>
-      <div class="actions">
-        <button class="btn-success" onclick="openImportPaperModal()">&#x1F4E5; 导入试卷</button>
-        <button class="btn-outline" onclick="downloadPaperTemplate()">&#x1F4C4; 下载JSON模板</button>
+  try {
+    const rows = await api("/api/papers");
+    main.innerHTML = html`
+      <div class="page-header">
+        <h2>${t("papers.title")}</h2>
+        <div class="actions">
+          <button class="btn-success" onclick="openImportPaperModal()">&#x1F4E5; ${t("papers.importBtn")}</button>
+          <div class="template-menu" id="paper-template-menu">
+            <button class="btn-outline" onclick="toggleTemplateMenu(event)">&#x1F4C4; ${t("papers.templateBtn")} &#x25BE;</button>
+            <div class="menu" style="display:none" id="paper-template-sub">
+              <div class="item" onclick="downloadPaperTemplate('xlsx')">${t("papers.templateFormatExcel")}</div>
+              <div class="item" onclick="downloadPaperTemplate('json')">${t("papers.templateFormatJson")}</div>
+              <div class="item" onclick="downloadPaperTemplate('md')">${t("papers.templateFormatMd")}</div>
+            </div>
+          </div>
+        </div>
       </div>
-    </div>
-    <div class="panel">
-      <h3>导入格式说明</h3>
-      <ul class="info-list">
-        <li>推荐使用 JSON：最完整，能保存题型、选项、答案、分值和关键词。</li>
-        <li>也支持 Markdown：适合手写试卷；支持 Excel：适合表格批量录入。</li>
-        <li>支持题型：单选题、多选题、判断题、简答题。</li>
-      </ul>
-    </div>
-    <div class="table-wrap">
-      <div class="table-header">
-        <h3>试卷列表</h3>
+      <div class="table-wrap">
+        <div class="table-header">
+          <h3>${t("papers.listTitle")}</h3>
+        </div>
+        <table>
+          <thead>
+            <tr><th>${t("papers.colId")}</th><th>${t("papers.colTitle")}</th><th>${t("papers.colTotalScore")}</th><th>${t("papers.colDuration")}</th></tr>
+          </thead>
+          <tbody>
+            ${rows.length === 0 ? `<tr><td colspan="4" class="table-empty">${t("common.empty")}</td></tr>` :
+              rows.map((r) => `<tr><td style="color:var(--primary)">${r.paper_id}</td><td>${escapeHtml(r.title)}</td><td>${r.total_score}</td><td>${r.duration_minutes}</td></tr>`).join("")}
+          </tbody>
+        </table>
       </div>
-      <table>
-        <thead>
-          <tr><th>试卷编号</th><th>标题</th><th>总分</th><th>时长</th></tr>
-        </thead>
-        <tbody>
-          ${rows.map((r) => `<tr><td style="color:var(--primary)">${r.paper_id}</td><td>${r.title}</td><td>${r.total_score}分</td><td>${r.duration_minutes}分钟</td></tr>`).join("")}
-        </tbody>
-      </table>
-    </div>
-  `;
+    `;
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+}
+
+function toggleTemplateMenu(event) {
+  event.stopPropagation();
+  const menu = document.querySelector("#paper-template-sub");
+  if (menu) menu.style.display = menu.style.display === "none" ? "block" : "none";
+  document.addEventListener("click", () => {
+    if (menu) menu.style.display = "none";
+  }, { once: true });
+}
+
+async function downloadPaperTemplate(fmt) {
+  try {
+    const res = await api(`/api/teacher/papers/template?format=${fmt}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `paper_template.${fmt === "md" ? "md" : fmt}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) { showToast(err.message, "error"); }
 }
 
 function openImportPaperModal() {
@@ -977,279 +1497,363 @@ function openImportPaperModal() {
   overlay.innerHTML = html`
     <div class="modal-form">
       <div class="modal-form-header">
-        <h3>&#x1F4E5; 导入试卷</h3>
+        <h3>&#x1F4E5; ${t("papers.modalTitle")}</h3>
         <button type="button" class="close-btn" data-act="close">&#x2715;</button>
       </div>
       <label class="upload-zone" id="paper-upload-zone">
         <div class="upload-icon">&#x1F4C2;</div>
-        <div class="upload-text">点击此处选择 JSON / Markdown / Excel 试卷，或拖拽到此处</div>
-        <div class="hint">支持 .json、.md、.markdown、.txt、.xlsx</div>
-        <input type="file" id="paper-file-input" accept=".json,.md,.markdown,.txt,.xlsx" hidden />
+        <div class="upload-text">${t("papers.modalSupport")}</div>
+        <div class="upload-hint">.xlsx / .xls / .json / .md</div>
+        <div class="file-name" id="paper-file-name" style="display:none"></div>
+        <input type="file" id="paper-file-input" accept=".xlsx,.xls,.json,.md,.markdown" />
       </label>
-      <div class="panel" style="margin:12px 0">
-        <strong>JSON 模板最推荐：</strong>
-        <p class="hint">字段包含 title、duration_minutes、questions；每道题包含 type、content、options、answer、score。</p>
-      </div>
+      <div class="field-hint"><strong>${t("papers.modalExcelCol")}</strong></div>
+      <div id="paper-import-errors" style="display:none;max-height:200px;overflow:auto;background:var(--danger-light);border:1px solid var(--danger-border);padding:10px;border-radius:6px;margin-top:10px;font-size:12px;color:var(--danger)"></div>
       <div class="form-actions">
-        <button type="button" class="btn-outline" data-act="close">取消</button>
-        <button type="button" class="btn-primary" id="confirm-paper-import" disabled onclick="confirmImportPaper()">开始导入</button>
+        <button type="button" class="btn-outline" data-act="close">${t("common.cancel")}</button>
+        <button type="button" class="btn-primary" id="confirm-paper-import" disabled onclick="confirmImportPaper()">${t("common.import")}</button>
       </div>
     </div>
   `;
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
-  overlay.querySelectorAll('[data-act="close"]').forEach((btn) => btn.onclick = close);
-  const input = overlay.querySelector("#paper-file-input");
-  const zone = overlay.querySelector("#paper-upload-zone");
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+    if (e.target.dataset.act === "close" || e.target.closest('[data-act="close"]')) close();
+  });
+  const fileInput = overlay.querySelector("#paper-file-input");
+  const fileName = overlay.querySelector("#paper-file-name");
   const confirmBtn = overlay.querySelector("#confirm-paper-import");
-  zone.onclick = () => input.click();
-  input.onchange = () => {
-    if (input.files.length) {
-      zone.querySelector(".upload-text").textContent = `已选择：${input.files[0].name}`;
+  const uploadZone = overlay.querySelector("#paper-upload-zone");
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files.length) {
+      const f = fileInput.files[0];
+      fileName.textContent = `${f.name} (${(f.size/1024).toFixed(1)} KB)`;
+      fileName.style.display = "block";
       confirmBtn.disabled = false;
     }
-  };
-  zone.ondragover = (event) => {
-    event.preventDefault();
-    zone.classList.add("drag-over");
-  };
-  zone.ondragleave = () => zone.classList.remove("drag-over");
-  zone.ondrop = (event) => {
-    event.preventDefault();
-    zone.classList.remove("drag-over");
-    if (event.dataTransfer.files.length) {
-      input.files = event.dataTransfer.files;
-      zone.querySelector(".upload-text").textContent = `已选择：${input.files[0].name}`;
-      confirmBtn.disabled = false;
+  });
+  uploadZone.addEventListener("dragover", (e) => { e.preventDefault(); uploadZone.classList.add("drag-over"); });
+  uploadZone.addEventListener("dragleave", () => uploadZone.classList.remove("drag-over"));
+  uploadZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    uploadZone.classList.remove("drag-over");
+    if (e.dataTransfer.files.length) {
+      fileInput.files = e.dataTransfer.files;
+      fileInput.dispatchEvent(new Event("change"));
     }
-  };
+  });
 }
 
 async function confirmImportPaper() {
-  const input = document.querySelector("#paper-file-input");
-  const confirmBtn = document.querySelector("#confirm-paper-import");
-  if (!input || !input.files.length) {
-    showToast("请先选择试卷文件", "error");
-    return;
-  }
+  const fileInput = document.querySelector("#paper-file-input");
+  if (!fileInput || !fileInput.files.length) { showToast(t("error.FILE_REQUIRED"), "error"); return; }
   const formData = new FormData();
-  formData.append("file", input.files[0]);
+  formData.append("file", fileInput.files[0]);
+  const overlay = document.querySelector(".modal-overlay");
+  const confirmBtn = document.querySelector("#confirm-paper-import");
+  const errBox = document.querySelector("#paper-import-errors");
   confirmBtn.disabled = true;
-  confirmBtn.textContent = "导入中...";
+  confirmBtn.textContent = t("common.loading");
   try {
     const headers = {};
     if (state.token) headers.Authorization = `Bearer ${state.token}`;
-    const res = await fetch("/api/papers/import", { method: "POST", body: formData, headers });
+    const res = await fetch("/api/teacher/papers/import", { method: "POST", body: formData, headers });
     const body = await res.json();
-    if (!res.ok || body.code !== 200) throw new Error(body.message || "导入失败");
-    document.querySelector(".modal-overlay")?.remove();
-    showToast(`试卷导入成功：${body.data.title}，共 ${body.data.question_count} 题`, "success");
+    if (!res.ok || body.code !== 200) {
+      const errs = (body.data && body.data.errors) || [];
+      if (errs.length) {
+        errBox.style.display = "block";
+        errBox.innerHTML = errs.map((e) => `<div>Row ${e.row} · ${e.field} · ${escapeHtml(e.reason)}</div>`).join("");
+      }
+      throw new Error(translateError(body.message));
+    }
+    overlay.remove();
+    showToast(t("papers.importSuccess", { n: body.data.question_count }), "success");
     renderTeacher();
   } catch (err) {
     showToast(err.message, "error");
     confirmBtn.disabled = false;
-    confirmBtn.textContent = "开始导入";
+    confirmBtn.textContent = t("common.import");
   }
-}
-
-function downloadPaperTemplate() {
-  const template = {
-    paper_id: "P20260605001",
-    title: "Web前端基础测试",
-    duration_minutes: 90,
-    questions: [
-      {
-        question_no: 1,
-        type: "single_choice",
-        content: "HTML 的全称是什么？",
-        options: [
-          { key: "A", value: "HyperText Markup Language" },
-          { key: "B", value: "HyperText Machine Language" },
-          { key: "C", value: "HighText Markup Language" },
-          { key: "D", value: "HyperTool Markup Language" }
-        ],
-        answer: "A",
-        score: 5
-      },
-      {
-        question_no: 2,
-        type: "multiple_choice",
-        content: "下面哪些属于前端基础技术？",
-        options: [
-          { key: "A", value: "HTML" },
-          { key: "B", value: "CSS" },
-          { key: "C", value: "JavaScript" },
-          { key: "D", value: "SQLite" }
-        ],
-        answer: "A,B,C",
-        score: 10
-      },
-      {
-        question_no: 3,
-        type: "true_false",
-        content: "CSS 可以控制网页的视觉样式。",
-        answer: "true",
-        score: 5
-      },
-      {
-        question_no: 4,
-        type: "short_answer",
-        content: "请简述前端、后端、数据库分别负责什么。",
-        answer: "",
-        keywords: ["前端", "后端", "数据库"],
-        score: 15
-      }
-    ]
-  };
-  const blob = new Blob([JSON.stringify(template, null, 2)], { type: "application/json;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "paper-template.json";
-  a.click();
-  URL.revokeObjectURL(url);
-  showToast("试卷模板下载完成", "success");
 }
 
 /* ============================================
    考试管理
    ============================================ */
 async function renderExamAdmin(main) {
-  const [current, examList, papers] = await Promise.all([
-    api("/api/exam/current"),
-    api("/api/teacher/exams"),
-    api("/api/papers"),
-  ]);
-  main.innerHTML = html`
-    <div class="page-header">
-      <h2>考试管理</h2>
-      <div class="actions">
-        <button class="btn-success" onclick="openCreateExamModal()">&#x2795; 创建考试</button>
-      </div>
-    </div>
-    <div class="panel">
-      <h2>当前考试</h2>
-      <div class="exam-current-card">
-        <div class="exam-current-info">
-          <h3>${current.exam.name}</h3>
-          <div class="exam-current-meta">
-            <span>试卷: ${current.paper.title}</span>
-            <span>时长: ${current.exam.duration_minutes} 分钟</span>
-            <span>总分: ${current.paper.total_score} 分</span>
-          </div>
-          <div style="margin-top:10px">
-            状态: <span class="status ${current.exam.status}">${statusName(current.exam.status)}</span>
-            ${current.exam.start_time ? `<span class="hint" style="margin-left:12px">开始: ${formatTime(current.exam.start_time)}</span>` : ''}
-          </div>
-        </div>
-        <div class="exam-current-actions">
-          ${current.exam.status === 'waiting' || current.exam.status === 'ended' ?
-            `<button class="btn-primary" onclick="startExamAction()">&#x25B6; 开始考试</button>` :
-            `<button class="btn-primary" disabled style="opacity:0.5">&#x25B6; 考试进行中</button>`}
-          ${current.exam.status === 'running' ?
-            `<button class="btn-danger" onclick="endExamAction()">&#x25A0; 结束考试</button>` : ''}
-          <button class="btn-outline" onclick="autoEndCheck()">&#x23F1; 检查时长</button>
-        </div>
-      </div>
-    </div>
-    <div class="table-wrap">
-      <div class="table-header">
-        <h3>考试列表（历史记录）</h3>
-        <span class="hint">共 ${examList.length} 场考试</span>
-      </div>
-      <table>
-        <thead>
-          <tr><th>编号</th><th>考试名称</th><th>试卷</th><th>时长</th><th>状态</th><th>创建时间</th><th>操作</th></tr>
-        </thead>
-        <tbody>
-          ${examList.length === 0 ? '<tr><td colspan="7" class="table-empty">暂无考试</td></tr>' :
-            examList.map((e) => `
-              <tr>
-                <td style="color:var(--primary)">#${e.id}</td>
-                <td>${e.name}</td>
-                <td>${e.paper_title || e.paper_id}</td>
-                <td>${e.duration_minutes} 分钟</td>
-                <td><span class="status ${e.status}">${statusName(e.status)}</span></td>
-                <td class="hint">${formatTime(e.created_at)}</td>
-                <td>
-                  <button class="btn-text btn-sm" onclick="setTeacherTab('monitor')">监控</button>
-                  <button class="btn-text btn-sm" onclick="setTeacherTab('results')">成绩</button>
-                </td>
-              </tr>
-            `).join("")}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
-function formatTime(iso) {
-  if (!iso) return '-';
   try {
-    const d = new Date(iso);
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  } catch (e) { return iso; }
+    const [current, examList, papers] = await Promise.all([
+      api("/api/exam/current").catch(() => null),
+      api("/api/teacher/exams"),
+      api("/api/papers"),
+    ]);
+    // 选中的 exam：用户切换或默认最近一场
+    state.examAdminSelectedId = state.examAdminSelectedId || (current && current.exam && current.exam.id) || (examList[0] && examList[0].id);
+    const selected = (examList || []).find((e) => e.id === state.examAdminSelectedId) || (examList && examList[0]);
+    const selectedPaper = (papers || []).find((p) => p.paper_id === (selected && selected.paper_id));
+    main.innerHTML = html`
+      <div class="page-header">
+        <h2>${t("examAdmin.title")}</h2>
+        <div class="actions">
+          <button class="btn-success" onclick="openCreateExamModal()">&#x2795; ${t("examAdmin.createBtn")}</button>
+        </div>
+      </div>
+      ${selected ? `
+      <div class="panel">
+        <div class="panel-header-row">
+          <h2>${t("examAdmin.currentExam")}</h2>
+          <select class="filter-select" onchange="state.examAdminSelectedId=parseInt(this.value,10); renderTeacherTab();">
+            ${examList.map((e) => `<option value="${e.id}" ${e.id===selected.id?'selected':''}>#${e.id} - ${escapeHtml(e.name)} [${e.status}]</option>`).join("")}
+          </select>
+        </div>
+        <div class="exam-current-card">
+          <div class="exam-current-info">
+            <h3>#${selected.id} ${escapeHtml(selected.name)}</h3>
+            <div class="exam-current-meta">
+              <span><a class="link" onclick="openViewPaperModal('${selected.paper_id}')">&#x1F4D6; ${escapeHtml(selected.paper_title || selected.paper_id)}</a></span>
+              <span>${t("common.minutes", { n: selected.duration_minutes })}</span>
+              <span>${selectedPaper ? t("common.score", { n: selectedPaper.total_score }) : ""}</span>
+              <span>${t("examAdmin.fieldMaxAttempts")}: ${selected.max_attempts || 1}</span>
+            </div>
+            <div style="margin-top:10px">
+              <span class="status ${selected.status}">${statusName(selected.status)}</span>
+              ${selected.start_time ? `<span class="hint" style="margin-left:12px">${formatTime(selected.start_time)}</span>` : ''}
+            </div>
+          </div>
+          <div class="exam-current-actions">
+            ${selected.status === 'waiting' || selected.status === 'ended' ?
+              `<button class="btn-primary" onclick="startExamAction(${selected.id})">&#x25B6; ${t("examAdmin.startExam")}</button>` :
+              `<button class="btn-primary" disabled style="opacity:0.5">&#x25B6; ${t("examAdmin.examRunning")}</button>`}
+            ${selected.status === 'running' ?
+              `<button class="btn-danger" onclick="endExamAction(${selected.id})">&#x25A0; ${t("examAdmin.endExam")}</button>` : ''}
+            ${selected.status !== 'waiting' ?
+              `<button class="btn-outline" onclick="resetExamAction(${selected.id})">&#x21BA; ${t("examAdmin.resetExam")}</button>` : ''}
+            <button class="btn-outline" onclick="openViewPaperModal('${selected.paper_id}')">&#x1F4D6; ${t("examAdmin.viewPaper")}</button>
+            <button class="btn-outline" onclick="autoEndCheck(${selected.id})">&#x23F1; ${t("examAdmin.checkDuration")}</button>
+          </div>
+        </div>
+      </div>` : ""}
+      <div class="table-wrap">
+        <div class="table-header">
+          <h3>${t("examAdmin.examList")}</h3>
+          <div class="table-header-actions" style="display:flex;gap:8px;align-items:center">
+            <span class="hint">${t("examAdmin.totalExams", { n: examList.length })}</span>
+            <button class="btn-outline btn-sm" onclick="resetAllExamsAction()">&#x21BA; ${t("examAdmin.resetAllExams")}</button>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr><th>${t("examAdmin.colNo")}</th><th>${t("examAdmin.colName")}</th><th>${t("examAdmin.colPaper")}</th><th>${t("examAdmin.colDuration")}</th><th>${t("examAdmin.colMaxAttempts")}</th><th>${t("examAdmin.colStatus")}</th><th>${t("examAdmin.colCreatedAt")}</th><th>${t("examAdmin.colActions")}</th></tr>
+          </thead>
+          <tbody>
+            ${examList.length === 0 ? `<tr><td colspan="8" class="table-empty">${t("examAdmin.empty")}</td></tr>` :
+              examList.map((e) => `
+                <tr>
+                  <td style="color:var(--primary)">#${e.id}</td>
+                  <td>${escapeHtml(e.name)}</td>
+                  <td><a class="link" onclick="openViewPaperModal('${e.paper_id}')">${escapeHtml(e.paper_title || e.paper_id)}</a></td>
+                  <td>${e.duration_minutes}</td>
+                  <td>${e.max_attempts || 1}</td>
+                  <td><span class="status ${e.status}">${statusName(e.status)}</span></td>
+                  <td class="hint">${formatTime(e.created_at)}</td>
+                  <td class="row-actions">
+                    <button class="btn-text btn-sm" onclick="openEditExamModal(${e.id})">${t("common.edit")}</button>
+                    ${e.status === 'waiting' || e.status === 'ended' ?
+                      `<button class="btn-text btn-sm" style="color:var(--success)" onclick="startExamAction(${e.id})">&#x25B6; ${t("examAdmin.startExam")}</button>` :
+                      `<button class="btn-text btn-sm" style="color:var(--text-secondary);opacity:0.6" disabled>&#x25B6; ${t("examAdmin.examRunning")}</button>`}
+                    ${e.status === 'running' ?
+                      `<button class="btn-text btn-sm" style="color:var(--danger)" onclick="endExamAction(${e.id})">&#x25A0; ${t("examAdmin.endExam")}</button>` : ''}
+                    ${e.status !== 'waiting' ?
+                      `<button class="btn-text btn-sm" onclick="resetExamAction(${e.id})">&#x21BA; ${t("examAdmin.resetExam")}</button>` : ''}
+                    <button class="btn-text btn-sm" onclick="setTeacherTab('monitor'); setMonitorExamId(${e.id})">${t("examAdmin.actionMonitor")}</button>
+                    <button class="btn-text btn-sm" onclick="setTeacherTab('results'); setResultsExamId(${e.id})">${t("examAdmin.actionResults")}</button>
+                    <button class="btn-text btn-sm" onclick="autoEndCheck(${e.id})">&#x23F1; ${t("examAdmin.checkDuration")}</button>
+                    <button class="btn-text btn-sm" style="color:var(--danger)" onclick="deleteExamAction(${e.id})">${t("common.delete")}</button>
+                  </td>
+                </tr>
+              `).join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (err) { showToast(err.message, "error"); }
 }
 
-async function startExamAction() {
+async function startExamAction(examId) {
   showModal({
     icon: "&#x25B6;&#xFE0F;",
-    title: "开始考试",
-    message: "考试开始后，学生可以登录并参加考试。是否立即开始？",
-    confirmText: "开始考试",
+    title: t("examAdmin.startExam"),
+    message: (examId ? t("examAdmin.startExamForId", { id: examId }) : t("examAdmin.startExam")),
+    confirmText: t("common.confirm"),
     onConfirm: async () => {
       try {
-        await api("/api/teacher/start-exam", { method: "POST", body: JSON.stringify({}) });
-        showToast("考试已开始", "success");
+        await api("/api/teacher/start-exam", { method: "POST", body: JSON.stringify({ exam_id: examId || null }) });
+        showToast(t("examAdmin.startExam") + " ✓", "success");
         renderTeacher();
-      } catch (err) {
-        showToast(err.message, "error");
-      }
+      } catch (err) { showToast(err.message, "error"); }
     },
   });
 }
 
-async function endExamAction() {
+/** 把单场考试从『running / ended / closed』退回『waiting』 */
+function resetExamAction(examId) {
+  showModal({
+    icon: "&#x21BA;&#xFE0F;",
+    title: t("examAdmin.resetExam"),
+    message: t("examAdmin.resetExamForId", { id: examId }),
+    confirmText: t("common.confirm"),
+    cancelText: t("common.cancel"),
+    onConfirm: async () => {
+      try {
+        await api("/api/teacher/reset-exam", { method: "POST", body: JSON.stringify({ exam_id: examId }) });
+        showToast(t("examAdmin.resetExam") + " ✓", "success");
+        renderTeacher();
+      } catch (err) { showToast(err.message, "error"); }
+    },
+  });
+}
+
+/** 一键把所有非 waiting 状态的考试退回 waiting。 */
+function resetAllExamsAction() {
+  showModal({
+    icon: "&#x21BA;&#xFE0F;",
+    title: t("examAdmin.resetAllExams"),
+    message: t("examAdmin.resetAllExamsConfirm"),
+    confirmText: t("common.confirm"),
+    cancelText: t("common.cancel"),
+    onConfirm: async () => {
+      try {
+        await api("/api/teacher/reset-exam", { method: "POST", body: JSON.stringify({ all: true }) });
+        showToast(t("examAdmin.resetAllExams") + " ✓", "success");
+        renderTeacher();
+      } catch (err) { showToast(err.message, "error"); }
+    },
+  });
+}
+
+async function endExamAction(examId) {
   showModal({
     icon: "&#x26D4;",
-    title: "结束考试",
-    message: "结束考试后将自动收卷并判分。是否确认结束？",
-    confirmText: "结束考试",
+    title: t("examAdmin.endExam"),
+    message: (examId ? t("examAdmin.endExamForId", { id: examId }) : t("examAdmin.endExam")),
+    confirmText: t("common.confirm"),
     danger: true,
     onConfirm: async () => {
       try {
-        await api("/api/teacher/end-exam", { method: "POST", body: JSON.stringify({}) });
-        showToast("考试已结束", "success");
+        await api("/api/teacher/end-exam", { method: "POST", body: JSON.stringify({ exam_id: examId || null }) });
+        showToast(t("examAdmin.endExam") + " ✓", "success");
         renderTeacher();
-      } catch (err) {
-        showToast(err.message, "error");
-      }
+      } catch (err) { showToast(err.message, "error"); }
     },
   });
 }
 
-async function autoEndCheck() {
+async function autoEndCheck(examId) {
   try {
-    const data = await api("/api/teacher/auto-end-check", { method: "POST", body: JSON.stringify({}) });
+    const data = await api("/api/teacher/auto-end-check", { method: "POST", body: JSON.stringify({ exam_id: examId || null }) });
     if (data.ended) {
       showModal({
         icon: "&#x23F0;",
-        title: "考试已自动结束",
-        message: `考试时长已到，已自动结束，并对 ${data.forced_count} 名未交卷学生执行了强制收卷。`,
-        confirmText: "我知道了",
-        cancelText: "关闭",
+        title: t("examAdmin.durationExpire"),
+        message: t("examAdmin.durationExpireForced", { n: data.forced_count }),
+        confirmText: t("common.confirm"),
         onConfirm: () => renderTeacher(),
       });
     } else if (data.remaining_seconds) {
       const minutes = Math.floor(data.remaining_seconds / 60);
-      showToast(`考试进行中，剩余 ${minutes} 分钟`, "info");
+      showToast(t("examAdmin.remainingMinutes", { n: minutes }), "info");
     } else {
-      showToast("当前不在考试进行中", "info");
+      showToast(t("examAdmin.notRunning"), "info");
     }
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function deleteExamAction(examId) {
+  showModal({
+    icon: "&#x26A0;&#xFE0F;",
+    title: t("common.delete"),
+    message: t("examAdmin.deleteConfirm"),
+    confirmText: t("common.delete"),
+    danger: true,
+    onConfirm: async () => {
+      try {
+        await api(`/api/teacher/exams/${examId}`, { method: "DELETE" });
+        showToast(t("examAdmin.deleteSuccess"), "success");
+        renderTeacher();
+      } catch (err) { showToast(err.message, "error"); }
+    },
+  });
+}
+
+/* ============================================
+   查看试卷（教师）
+   ============================================ */
+async function openViewPaperModal(paperId) {
+  try {
+    const data = await api(`/api/papers/${encodeURIComponent(paperId)}`);
+    const p = data || {};
+    const questions = p.questions || [];
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const renderQ = (q) => {
+      const opts = (q.options || []).map((o, i) => {
+        const letter = String.fromCharCode(65 + i);
+        const text = typeof o === 'string' ? o : (o.value || o.text || '');
+        return `<li><strong>${letter}.</strong> ${escapeHtml(text)}</li>`;
+      }).join("");
+      let answerLine = "";
+      if (q.type === "fill_blank") {
+        const ans = (q.answer || "").split(",").map(s => s.trim()).filter(Boolean);
+        answerLine = `<div class="q-answer"><strong>${t("paperView.answer")}:</strong> ${ans.map(a => `<code>${escapeHtml(a)}</code>`).join(" / ")}</div>`;
+      } else if (q.type === "multiple_choice") {
+        const ans = (q.answer || "").split(",").map(s => s.trim()).filter(Boolean);
+        answerLine = `<div class="q-answer"><strong>${t("paperView.answer")}:</strong> ${ans.map(a => `<code>${escapeHtml(a)}</code>`).join(" / ")}</div>`;
+      } else if (q.answer) {
+        answerLine = `<div class="q-answer"><strong>${t("paperView.answer")}:</strong> <code>${escapeHtml(q.answer)}</code></div>`;
+      }
+      let keywords = "";
+      if (q.keywords && q.keywords.length) {
+        keywords = `<div class="q-keywords"><strong>${t("paperView.keywords")}:</strong> ${q.keywords.map(k => `<code>${escapeHtml(k)}</code>`).join(" / ")}</div>`;
+      }
+      return `
+        <div class="paper-q">
+          <div class="paper-q-head">
+            <span class="qno">#${q.question_no}</span>
+            <span class="qtype">${questionTypeName(q.type)}</span>
+            <span class="qscore">${t("common.score", { n: q.score })}</span>
+          </div>
+          <div class="paper-q-content">${escapeHtml(q.content)}</div>
+          ${opts ? `<ol class="paper-q-options">${opts}</ol>` : ""}
+          ${answerLine}
+          ${keywords}
+        </div>
+      `;
+    };
+    overlay.innerHTML = html`
+      <div class="modal-form modal-paper-view" style="max-width:760px;max-height:85vh;overflow-y:auto">
+        <div class="modal-form-header">
+          <h3>&#x1F4D6; ${escapeHtml(p.title || paperId)} <span class="hint">${paperId}</span></h3>
+          <button type="button" class="close-btn" data-act="close">&#x2715;</button>
+        </div>
+        <div class="paper-view-meta">
+          <span>${t("paperView.totalQuestions", { n: questions.length })}</span>
+          <span>${t("paperView.totalScore", { n: p.total_score })}</span>
+          <span>${t("common.minutes", { n: p.duration_minutes })}</span>
+        </div>
+        <div class="paper-view-body">${questions.map(renderQ).join("") || `<div class="hint">${t("paperView.empty")}</div>`}</div>
+        <div class="form-actions">
+          <button type="button" class="btn-primary" data-act="close">${t("common.confirm")}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close();
+      if (e.target.dataset && e.target.dataset.act === "close") close();
+    });
+  } catch (err) { showToast(err.message, "error"); }
 }
 
 function openCreateExamModal() {
@@ -1259,30 +1863,35 @@ function openCreateExamModal() {
     overlay.innerHTML = html`
       <form class="modal-form" onsubmit="submitCreateExam(event)">
         <div class="modal-form-header">
-          <h3>&#x2795; 创建考试</h3>
+          <h3>&#x2795; ${t("examAdmin.modalCreateTitle")}</h3>
           <button type="button" class="close-btn" data-act="close">&#x2715;</button>
         </div>
         <div class="field">
-          <label>考试名称<span class="required">*</span></label>
-          <input name="name" placeholder="例如: 2024-2025学年第一学期期末考试" required />
+          <label>${t("examAdmin.fieldName")} <span class="required">*</span></label>
+          <input name="name" placeholder="${t("examAdmin.fieldName")}" required />
         </div>
         <div class="exam-form-grid">
           <div class="field">
-            <label>选择试卷<span class="required">*</span></label>
+            <label>${t("examAdmin.fieldPaper")} <span class="required">*</span></label>
             <select name="paper_id" class="filter-select" required>
-              <option value="">请选择试卷</option>
-              ${papers.map((p) => `<option value="${p.paper_id}">${p.paper_id} - ${p.title} (${p.total_score}分)</option>`).join("")}
+              <option value="">${t("examAdmin.fieldPaper")}</option>
+              ${papers.map((p) => `<option value="${p.paper_id}">${p.paper_id} - ${escapeHtml(p.title)} (${p.total_score})</option>`).join("")}
             </select>
           </div>
           <div class="field">
-            <label>考试时长（分钟）</label>
+            <label>${t("examAdmin.fieldDuration")}</label>
             <input name="duration_minutes" type="number" min="1" max="600" value="90" required />
-            <div class="field-hint">默认 90 分钟</div>
+            <div class="field-hint">${t("common.minutes", { n: 90 })}</div>
           </div>
         </div>
+        <div class="field">
+          <label>${t("examAdmin.fieldMaxAttempts")}</label>
+          <input name="max_attempts" type="number" min="0" max="99" value="1" required />
+          <div class="field-hint">${t("examAdmin.maxAttemptsHint")}</div>
+        </div>
         <div class="form-actions">
-          <button type="button" class="btn-outline" data-act="close">取消</button>
-          <button type="submit" class="btn-primary">创建考试</button>
+          <button type="button" class="btn-outline" data-act="close">${t("common.cancel")}</button>
+          <button type="submit" class="btn-primary">${t("common.save")}</button>
         </div>
       </form>
     `;
@@ -1292,7 +1901,7 @@ function openCreateExamModal() {
       if (e.target === overlay) close();
       if (e.target.dataset.act === "close") close();
     });
-  });
+  }).catch((err) => showToast(err.message, "error"));
 }
 
 async function submitCreateExam(event) {
@@ -1302,155 +1911,473 @@ async function submitCreateExam(event) {
   try {
     await api("/api/teacher/exams", { method: "POST", body: JSON.stringify(data) });
     overlay.remove();
-    showToast("考试已创建，已设为当前考试", "success");
+    showToast(t("examAdmin.createSuccess"), "success");
     renderTeacher();
-  } catch (err) {
-    showToast(err.message, "error");
-  }
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function openEditExamModal(examId) {
+  try {
+    const [exams, papers] = await Promise.all([api("/api/teacher/exams"), api("/api/papers")]);
+    const exam = (exams || []).find((e) => e.id === examId);
+    if (!exam) { showToast(t("error.EXAM_NOT_FOUND"), "error"); return; }
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = html`
+      <form class="modal-form" onsubmit="submitEditExam(event, ${examId})">
+        <div class="modal-form-header">
+          <h3>&#x270D; ${t("examAdmin.modalEditTitle")}</h3>
+          <button type="button" class="close-btn" data-act="close">&#x2715;</button>
+        </div>
+        <div class="field">
+          <label>${t("examAdmin.fieldName")} <span class="required">*</span></label>
+          <input name="name" value="${escapeHtml(exam.name)}" required />
+        </div>
+        <div class="field">
+          <label>${t("examAdmin.fieldPaper")}</label>
+          <input value="${escapeHtml(exam.paper_title || exam.paper_id)}" disabled />
+          <div class="field-hint">${t("examList.paper", { title: "" })}</div>
+        </div>
+        <div class="exam-form-grid">
+          <div class="field">
+            <label>${t("examAdmin.fieldDuration")}</label>
+            <input name="duration_minutes" type="number" min="1" max="600" value="${exam.duration_minutes}" required />
+          </div>
+          <div class="field">
+            <label>${t("examAdmin.fieldMaxAttempts")}</label>
+            <input name="max_attempts" type="number" min="0" max="99" value="${exam.max_attempts || 1}" required />
+            <div class="field-hint">${t("examAdmin.maxAttemptsEditHint")}</div>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn-outline" data-act="close">${t("common.cancel")}</button>
+          <button type="submit" class="btn-primary">${t("common.save")}</button>
+        </div>
+      </form>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close();
+      if (e.target.dataset.act === "close") close();
+    });
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function submitEditExam(event, examId) {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.target));
+  const overlay = event.target.closest(".modal-overlay");
+  try {
+    await api(`/api/teacher/exams/${examId}`, { method: "PUT", body: JSON.stringify(data) });
+    overlay.remove();
+    showToast(t("examAdmin.updateSuccess"), "success");
+    renderTeacher();
+  } catch (err) { showToast(err.message, "error"); }
 }
 
 /* ============================================
    实时监控
    ============================================ */
 async function renderMonitor(main) {
-  const data = await api("/api/teacher/monitor");
-  main.innerHTML = html`
-    <div class="page-header">
-      <h2>实时监控</h2>
-    </div>
-    <div class="stats-grid">
-      <div class="stat-card-mini">
-        <div class="stat-label">总人数</div>
-        <div class="stat-value">${data.stats.total}</div>
+  try {
+    const params = state.monitorExamId ? `?exam_id=${state.monitorExamId}` : "";
+    const [data, examList] = await Promise.all([
+      api("/api/teacher/monitor" + params),
+      api("/api/teacher/exams").catch(() => []),
+    ]);
+    const examInfo = data.exam || {};
+    const examOptions = (examList || [])
+      .map((e) => `<option value="${e.id}" ${state.monitorExamId == e.id ? "selected" : ""}>#${e.id} ${escapeHtml(e.name)} [${statusName(e.status)}]</option>`)
+      .join("");
+    main.innerHTML = html`
+      <div class="page-header">
+        <h2>${t("monitor.title")} <span class="hint">${examInfo.name ? `· #${examInfo.id} ${escapeHtml(examInfo.name)} [${examInfo.status}]` : ""}</span></h2>
+        <div class="page-header-actions" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <label class="hint" for="monitor-exam-select">${t("monitor.selectExam") || "选择考试"}：</label>
+          <select id="monitor-exam-select" class="filter-select" onchange="onMonitorExamChange(this.value)">
+            <option value="" ${!state.monitorExamId ? "selected" : ""}>${t("monitor.latest") || "最新一场"}</option>
+            ${examOptions}
+          </select>
+          ${state.monitorExamId ? `<button class="btn-outline" onclick="setMonitorExamId(null); renderTeacherTab();">&#x2190; ${t("common.back") || t("nav.dashboard")}</button>` : ""}
+        </div>
       </div>
-      <div class="stat-card-mini">
-        <div class="stat-label" style="color:var(--primary)">已登录</div>
-        <div class="stat-value" style="color:var(--primary)">${data.stats.logged_in}</div>
+      <div class="stats-grid">
+        <div class="stat-card-mini"><div class="stat-label">${t("monitor.totalStudents")}</div><div class="stat-value">${data.stats.total}</div></div>
+        <div class="stat-card-mini"><div class="stat-label" style="color:var(--primary)">${t("monitor.loggedIn")}</div><div class="stat-value" style="color:var(--primary)">${data.stats.logged_in}</div></div>
+        <div class="stat-card-mini"><div class="stat-label" style="color:var(--success)">${t("monitor.answering")}</div><div class="stat-value" style="color:var(--success)">${data.stats.answering}</div></div>
+        <div class="stat-card-mini"><div class="stat-label" style="color:var(--warning)">${t("monitor.submitted")}</div><div class="stat-value" style="color:var(--warning)">${data.stats.submitted}</div></div>
+        <div class="stat-card-mini"><div class="stat-label">${t("monitor.notLoggedIn")}</div><div class="stat-value">${data.stats.not_logged_in}</div></div>
       </div>
-      <div class="stat-card-mini">
-        <div class="stat-label" style="color:var(--success)">答题中</div>
-        <div class="stat-value" style="color:var(--success)">${data.stats.answering}</div>
+      <div class="table-wrap">
+        <div class="table-header"><h3>${t("monitor.title")}</h3></div>
+        <table>
+          <thead><tr><th>${t("monitor.colId")}</th><th>${t("monitor.colName")}</th><th>${t("monitor.colStatus")}</th><th>${t("monitor.colProgress")}</th><th>${t("monitor.colActions")}</th></tr></thead>
+          <tbody>
+            ${data.students.map((s) => `
+              <tr>
+                <td>${s.student_id}</td>
+                <td>${escapeHtml(s.name)}</td>
+                <td><span class="status ${s.status}">${statusName(s.status)}</span></td>
+                <td>${s.answered} / ${s.total}</td>
+                <td>${s.submitted ? `<span class="hint">${t("monitor.submittedHint")}</span>` : `<button class="btn-danger btn-sm" onclick="forceSubmit('${s.student_id}')">${t("monitor.forceSubmit")}</button>`}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
       </div>
-      <div class="stat-card-mini">
-        <div class="stat-label" style="color:var(--warning)">已提交</div>
-        <div class="stat-value" style="color:var(--warning)">${data.stats.submitted}</div>
+    `;
+    state.monitorTimer = setTimeout(() => renderMonitor(main), 5000);
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function forceSubmit(studentId) {
+  try {
+    const body = { student_id: studentId };
+    if (state.monitorExamId) body.exam_id = state.monitorExamId;
+    await api("/api/teacher/force-submit", { method: "POST", body: JSON.stringify(body) });
+    showToast(t("error.FORCE_SUBMITTED"), "info");
+    renderTeacher();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function onMonitorExamChange(val) {
+  const id = val ? parseInt(val, 10) : null;
+  setMonitorExamId(id);
+  // 直接重渲染当前 tab
+  if (state.monitorTimer) { clearTimeout(state.monitorTimer); state.monitorTimer = null; }
+  const main = document.querySelector("#teacher-main");
+  if (main) renderMonitor(main);
+}
+
+/* ============================================
+   批改
+   ============================================ */
+async function renderGrading(main) {
+  try {
+    const exams = await api("/api/teacher/grading/exams");
+    // 优先级：state.resultsExamId（来自考试管理表格） > state.grading.examId
+    if (state.resultsExamId) {
+      state.grading.examId = state.resultsExamId;
+      state.resultsExamId = null;
+    } else if (!state.grading.examId && exams.length > 0) {
+      state.grading.examId = exams[0].id;
+    }
+    main.innerHTML = html`
+      <div class="page-header">
+        <h2>${t("grading.title")}</h2>
       </div>
-      <div class="stat-card-mini">
-        <div class="stat-label">未登录</div>
-        <div class="stat-value">${data.stats.not_logged_in}</div>
+      <div class="filter-bar">
+        <div class="field">
+          <label>${t("grading.selectExam")}</label>
+          <select id="grading-exam-select" onchange="onGradingExamChange()">
+            <option value="">${t("grading.allExams")}</option>
+            ${exams.map((e) => `<option value="${e.id}" ${state.grading.examId == e.id ? "selected" : ""}>${escapeHtml(e.name)} (${e.record_count || 0})</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>${t("grading.colStatus")}</label>
+          <select id="grading-status" onchange="onGradingFilterChange()">
+            <option value="all" ${state.grading.status === "all" ? "selected" : ""}>${t("grading.statusAll")}</option>
+            <option value="pending" ${state.grading.status === "pending" ? "selected" : ""}>${t("grading.statusPending")}</option>
+            <option value="graded" ${state.grading.status === "graded" ? "selected" : ""}>${t("grading.statusGraded")}</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>${t("grading.sortBy")}</label>
+          <select id="grading-sort" onchange="onGradingFilterChange()">
+            <option value="student_id" ${state.grading.sort === "student_id" ? "selected" : ""}>${t("grading.sortStudentId")}</option>
+            <option value="name" ${state.grading.sort === "name" ? "selected" : ""}>${t("grading.sortName")}</option>
+            <option value="score" ${state.grading.sort === "score" ? "selected" : ""}>${t("grading.sortScore")}</option>
+            <option value="submitted_at" ${state.grading.sort === "submitted_at" ? "selected" : ""}>${t("grading.sortTime")}</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>${t("common.search")}</label>
+          <select id="grading-order" onchange="onGradingFilterChange()">
+            <option value="asc" ${state.grading.order === "asc" ? "selected" : ""}>${t("grading.asc")}</option>
+            <option value="desc" ${state.grading.order === "desc" ? "selected" : ""}>${t("grading.desc")}</option>
+          </select>
+        </div>
+        <div class="field keyword">
+          <input id="grading-keyword" placeholder="${t("common.search.keyword")}" value="${state.grading.keyword}" oninput="onGradingKeywordChange()" />
+        </div>
       </div>
-    </div>
+      <div id="grading-list-body"></div>
+    `;
+    if (state.grading.examId) {
+      await loadGradingList();
+    } else {
+      document.querySelector("#grading-list-body").innerHTML = `<div class="panel" style="text-align:center;color:var(--text-secondary)">${t("grading.selectExamHint")}</div>`;
+    }
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function onGradingExamChange() {
+  const v = document.querySelector("#grading-exam-select").value;
+  state.grading.examId = v ? parseInt(v, 10) : null;
+  state.grading.page = 1;
+  loadGradingList();
+}
+
+function onGradingFilterChange() {
+  state.grading.status = document.querySelector("#grading-status").value;
+  state.grading.sort = document.querySelector("#grading-sort").value;
+  state.grading.order = document.querySelector("#grading-order").value;
+  state.grading.page = 1;
+  loadGradingList();
+}
+
+let _gradingKwTimer;
+function onGradingKeywordChange() {
+  clearTimeout(_gradingKwTimer);
+  _gradingKwTimer = setTimeout(() => {
+    state.grading.keyword = document.querySelector("#grading-keyword").value;
+    state.grading.page = 1;
+    loadGradingList();
+  }, 350);
+}
+
+async function loadGradingList() {
+  if (!state.grading.examId) return;
+  const g = state.grading;
+  const params = new URLSearchParams({
+    exam_id: g.examId, status: g.status, keyword: g.keyword,
+    sort: g.sort, order: g.order, page: g.page, per_page: g.perPage,
+  });
+  try {
+    const data = await api(`/api/teacher/grading/list?${params.toString()}`);
+    renderGradingTable(data);
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function renderGradingTable(data) {
+  const container = document.querySelector("#grading-list-body");
+  if (!container) return;
+  if (!data.results || data.results.length === 0) {
+    container.innerHTML = `<div class="panel" style="text-align:center;color:var(--text-secondary)">${t("grading.noExam")}</div>`;
+    return;
+  }
+  const total = data.total;
+  const pending = data.results.filter((r) => !r.is_fully_graded).length;
+  container.innerHTML = html`
     <div class="table-wrap">
       <div class="table-header">
-        <h3>学生状态列表</h3>
+        <h3>${t("grading.title")}</h3>
+        <span class="hint">${t("grading.pendingCount", { n: pending })} / ${total}</span>
       </div>
       <table>
         <thead>
-          <tr><th>学号</th><th>姓名</th><th>状态</th><th>答题进度</th><th>操作</th></tr>
+          <tr>
+            <th>${t("grading.colNo")}</th>
+            <th>${t("grading.colStudentId")}</th>
+            <th>${t("grading.colName")}</th>
+            <th>${t("grading.colClass")}</th>
+            <th>${t("grading.colObjective")}</th>
+            <th>${t("grading.colSubjective")}</th>
+            <th>${t("grading.colTotal")}</th>
+            <th>${t("grading.colStatus")}</th>
+            <th>${t("grading.colSubmitTime")}</th>
+            <th>${t("grading.colActions")}</th>
+          </tr>
         </thead>
         <tbody>
-          ${data.students.map((s) => `
+          ${data.results.map((r, i) => `
             <tr>
-              <td>${s.student_id}</td>
-              <td>${s.name}</td>
-              <td><span class="status ${s.status}">${statusName(s.status)}</span></td>
-              <td>${s.answered} / ${s.total}</td>
-              <td>${s.submitted ? '<span class="hint">已提交</span>' : `<button class="btn-danger btn-sm" onclick="forceSubmit('${s.student_id}')">强制收卷</button>`}</td>
+              <td>${(data.current_page - 1) * data.per_page + i + 1}</td>
+              <td>${r.student_id}</td>
+              <td>${escapeHtml(r.name)}</td>
+              <td>${escapeHtml(r.class_name || "")}</td>
+              <td>${r.objective_score || 0}</td>
+              <td>${r.subjective_score || 0}</td>
+              <td style="font-weight:700;color:var(--primary)">${r.total_score || 0}</td>
+              <td><span class="status ${r.is_fully_graded ? "submitted" : "answering"}">${r.is_fully_graded ? t("grading.fullyGraded") : t("grading.pending")} (${r.pending_count})</span></td>
+              <td class="hint">${formatTime(r.submit_time)}</td>
+              <td><button class="btn-text btn-sm" onclick="openGradingDetail(${r.record_id})">${r.is_fully_graded ? t("grading.btnView") : t("grading.btnGrade")}</button></td>
             </tr>
           `).join("")}
         </tbody>
       </table>
+      <div class="pagination">
+        <span>${t("common.total", { n: total })}</span>
+        <button ${data.current_page <= 1 ? "disabled" : ""} onclick="gradingGoto(${data.current_page - 1})">&#x2190;</button>
+        ${Array.from({ length: data.pages }, (_, i) => i + 1).map((p) => `<button class="${p === data.current_page ? "active" : ""}" onclick="gradingGoto(${p})">${p}</button>`).join("")}
+        <button ${data.current_page >= data.pages ? "disabled" : ""} onclick="gradingGoto(${data.current_page + 1})">&#x2192;</button>
+      </div>
     </div>
   `;
-  state.monitorTimer = setTimeout(() => renderMonitor(main), 5000);
 }
 
-async function forceSubmit(studentId) {
-  await api("/api/teacher/force-submit", { method: "POST", body: JSON.stringify({ student_id: studentId }) });
-  renderTeacher();
+function gradingGoto(p) {
+  state.grading.page = p;
+  loadGradingList();
 }
 
-/* ============================================
-   批改评分
-   ============================================ */
-async function renderGrading(main) {
-  const rows = await api("/api/grading/records");
-  main.innerHTML = html`
-    <div class="page-header">
-      <h2>批改评分</h2>
-      <span class="hint">进度: ${rows.length} 条待批改</span>
-    </div>
-    ${rows.length ? rows.map((r) => `
-      <div class="panel">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <strong style="color:var(--text-primary)">${r.student_id} ${r.name} - 第 ${r.question_no} 题</strong>
-          <span class="question-type-tag">简答题 ${r.max_score}分</span>
-        </div>
-        <p style="margin-bottom:8px;color:var(--text-regular)">${r.content}</p>
-        <div class="answer-box">
-          <div class="answer-label">学生答案:</div>
-          <p>${r.answer_text || "未作答"}</p>
-        </div>
-        <div class="grading-score-input">
-          <input style="max-width:140px" id="score${r.answer_id}" type="number" min="0" max="${r.max_score}" value="${r.score || 0}" placeholder="分数" />
-          <button class="btn-primary" onclick="saveScore(${r.answer_id})">保存评分</button>
-        </div>
+async function openGradingDetail(recordId) {
+  // 使用现有 grading/records 接口（已支持 exam_id 但我们需要传 exam_id）
+  // 简化：先取 exam_id，再请求 records
+  // 这里直接以 record_id 调用 grading/records 并前端过滤
+  try {
+    const params = new URLSearchParams({ exam_id: state.grading.examId });
+    const rows = await api(`/api/grading/records?${params.toString()}`);
+    const items = rows.filter((r) => r.record_id === recordId);
+    const main = document.querySelector("#teacher-main");
+    if (!items.length) {
+      showToast(t("grading.noExam"), "info");
+      return;
+    }
+    main.innerHTML = html`
+      <div class="page-header">
+        <h2>${t("grading.title")} - ${escapeHtml(items[0].name)} (${items[0].student_id})</h2>
+        <button class="btn-outline" onclick="setTeacherTab('grading')">&#x2190; ${t("common.previous")}</button>
       </div>
-    `).join("") : '<div class="panel"><p style="text-align:center;color:var(--text-secondary)">暂无可批改的简答题答案</p></div>'}
+      ${items.map((r) => renderGradingItem(r)).join("")}
+    `;
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function renderGradingItem(r) {
+  const isShort = r.type === "short_answer";
+  const qTypeLabel = isShort ? t("grading.qaShortAnswer") : t("grading.qaFillBlank");
+  let blankResult = "";
+  if (!isShort && r.answer_text) {
+    try {
+      const arr = JSON.parse(r.answer_text);
+      blankResult = `<div class="fill-blank-result">${arr.map((a, i) => `<span class="bs-item">${i + 1}. ${escapeHtml(String(a))}</span>`).join("")}</div>`;
+    } catch (e) { blankResult = `<p>${escapeHtml(r.answer_text)}</p>`; }
+  }
+  return html`
+    <div class="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <strong>${r.student_id} ${escapeHtml(r.name)} - ${t("common.question", { no: r.question_no })}</strong>
+        <span class="question-type-tag">${qTypeLabel} ${r.max_score} ${t("common.score", { n: "" }).trim()}</span>
+      </div>
+      <p style="margin-bottom:8px">${escapeHtml(r.content)}</p>
+      <div class="answer-box">
+        <div class="answer-label">${t("grading.answerLabel")}:</div>
+        ${isShort ? `<p>${escapeHtml(r.answer_text || t("grading.answerEmpty"))}</p>` : blankResult || `<p>${t("grading.answerEmpty")}</p>`}
+      </div>
+      <div class="grading-score-input">
+        <input style="max-width:140px" id="score${r.answer_id}" type="number" min="0" max="${r.max_score}" step="0.5" value="${r.score || 0}" placeholder="${t("common.score", { n: "" }).trim()}" />
+        <button class="btn-primary" onclick="saveScore(${r.answer_id})">${t("common.save")}</button>
+      </div>
+    </div>
   `;
 }
 
 async function saveScore(answerId) {
   const score = document.querySelector(`#score${answerId}`).value;
-  await api("/api/grading/manual", { method: "POST", body: JSON.stringify({ answer_id: answerId, score }) });
-  alert("评分已保存");
+  try {
+    await api("/api/grading/manual", { method: "POST", body: JSON.stringify({ answer_id: answerId, score }) });
+    showToast(t("grading.gradeSaved"), "success");
+  } catch (err) { showToast(err.message, "error"); }
 }
 
 /* ============================================
-   成绩管理
+   成绩
    ============================================ */
 async function renderResults(main) {
-  const data = await api("/api/teacher/results");
-  main.innerHTML = html`
-    <div class="page-header">
-      <h2>成绩管理</h2>
-      <button class="btn-success" onclick="downloadResults()">导出 Excel</button>
-    </div>
+  try {
+    const [exams, classes] = await Promise.all([
+      api("/api/teacher/exams").catch(() => []),
+      api("/api/teacher/classes").catch(() => []),
+    ]);
+    // 优先级：state.resultsExamId（来自考试管理表格） > state.results.examId
+    if (state.resultsExamId) {
+      state.results.examId = state.resultsExamId;
+      state.resultsExamId = null;
+    } else if (!state.results.examId && exams.length > 0) {
+      state.results.examId = exams[0].id;
+    }
+    main.innerHTML = html`
+      <div class="page-header">
+        <h2>${t("results.title")}</h2>
+        <div class="actions">
+          <button class="btn-success" onclick="exportResultsExcel()">&#x2B07; ${t("results.exportExcel")}</button>
+          <button class="btn-outline" onclick="exportResultsCsv()">&#x2B07; ${t("results.exportCsv")}</button>
+        </div>
+      </div>
+      <div class="filter-bar">
+        <div class="field">
+          <label>${t("results.selectExam")}</label>
+          <select id="results-exam-select" onchange="onResultsExamChange()">
+            ${exams.map((e) => `<option value="${e.id}" ${state.results.examId == e.id ? "selected" : ""}>${escapeHtml(e.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>${t("results.colClass")}</label>
+          <select id="results-class-select" onchange="onResultsClassChange()">
+            <option value="">${t("results.allClasses")}</option>
+            ${classes.map((c) => `<option value="${c}" ${state.results.className === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div id="results-list-body"></div>
+    `;
+    await loadResultsList();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function onResultsExamChange() {
+  state.results.examId = parseInt(document.querySelector("#results-exam-select").value, 10);
+  loadResultsList();
+}
+
+function onResultsClassChange() {
+  state.results.className = document.querySelector("#results-class-select").value;
+  loadResultsList();
+}
+
+async function loadResultsList() {
+  if (!state.results.examId) return;
+  const params = new URLSearchParams({ exam_id: state.results.examId });
+  if (state.results.className) params.set("class_name", state.results.className);
+  try {
+    const data = await api(`/api/teacher/results?${params.toString()}`);
+    renderResultsList(data);
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function renderResultsList(data) {
+  const container = document.querySelector("#results-list-body");
+  if (!container) return;
+  if (!data.results || data.results.length === 0) {
+    container.innerHTML = `<div class="panel" style="text-align:center;color:var(--text-secondary)">${t("results.empty")}</div>`;
+    return;
+  }
+  container.innerHTML = html`
     <div class="stats-grid">
-      <div class="stat-card-flat">
-        <div class="stat-label">平均分</div>
-        <div class="stat-value">${data.stats.average}</div>
-      </div>
-      <div class="stat-card-flat">
-        <div class="stat-label">最高分</div>
-        <div class="stat-value" style="color:var(--success)">${data.stats.highest}</div>
-      </div>
-      <div class="stat-card-flat">
-        <div class="stat-label">最低分</div>
-        <div class="stat-value" style="color:var(--danger)">${data.stats.lowest}</div>
-      </div>
-      <div class="stat-card-flat">
-        <div class="stat-label">及格率</div>
-        <div class="stat-value" style="color:var(--primary)">${data.stats.pass_rate}%</div>
-      </div>
+      <div class="stat-card-flat"><div class="stat-label">${t("results.average")}</div><div class="stat-value">${data.stats.average}</div></div>
+      <div class="stat-card-flat"><div class="stat-label">${t("results.highest")}</div><div class="stat-value" style="color:var(--success)">${data.stats.highest}</div></div>
+      <div class="stat-card-flat"><div class="stat-label">${t("results.lowest")}</div><div class="stat-value" style="color:var(--danger)">${data.stats.lowest}</div></div>
+      <div class="stat-card-flat"><div class="stat-label">${t("results.passRate")}</div><div class="stat-value" style="color:var(--primary)">${data.stats.pass_rate}%</div></div>
     </div>
     <div class="table-wrap">
-      <div class="table-header">
-        <h3>成绩列表</h3>
-      </div>
+      <div class="table-header"><h3>${t("results.title")}</h3></div>
       <table>
         <thead>
-          <tr><th>学号</th><th>姓名</th><th>客观分</th><th>主观分</th><th>总分</th><th>状态</th></tr>
+          <tr>
+            <th>${t("results.colStudentId")}</th>
+            <th>${t("results.colName")}</th>
+            <th>${t("results.colClass")}</th>
+            <th>${t("results.colObjective")}</th>
+            <th>${t("results.colSubjective")}</th>
+            <th>${t("results.colTotal")}</th>
+            <th>${t("results.colRank")}</th>
+            <th>${t("results.colStatus")}</th>
+          </tr>
         </thead>
         <tbody>
           ${data.results.map((r) => `
             <tr>
               <td>${r.student_id}</td>
-              <td>${r.name}</td>
+              <td>${escapeHtml(r.name)}</td>
+              <td>${escapeHtml(r.class_name || "")}</td>
               <td>${r.objective_score}</td>
               <td>${r.subjective_score}</td>
               <td style="font-weight:700;color:var(--success)">${r.total_score}</td>
-              <td><span class="status ${r.status || 'not_logged_in'}">${statusName(r.status || 'not_logged_in')}</span></td>
+              <td>${r.rank || "-"}</td>
+              <td><span class="status ${r.status || 'not_logged_in'}">${statusName(r.status || "not_logged_in")}</span></td>
             </tr>
           `).join("")}
         </tbody>
@@ -1459,29 +2386,54 @@ async function renderResults(main) {
   `;
 }
 
-async function downloadResults() {
-  const res = await api("/api/teacher/export");
-  const blob = await res.blob();
+async function exportResultsExcel() {
+  if (!state.results.examId) { showToast(t("results.selectExam"), "info"); return; }
+  const params = new URLSearchParams({ exam_id: state.results.examId, format: "xlsx" });
+  if (state.results.className) params.set("class_name", state.results.className);
+  try {
+    const res = await api(`/api/teacher/export?${params.toString()}`);
+    const blob = await res.blob();
+    downloadBlob(blob, `results_${Date.now()}.xlsx`);
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function exportResultsCsv() {
+  if (!state.results.examId) { showToast(t("results.selectExam"), "info"); return; }
+  const params = new URLSearchParams({ exam_id: state.results.examId, format: "csv" });
+  if (state.results.className) params.set("class_name", state.results.className);
+  try {
+    const res = await api(`/api/teacher/export?${params.toString()}`);
+    const blob = await res.blob();
+    downloadBlob(blob, `results_${Date.now()}.csv`);
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "exam-results.csv";
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
 }
 
-function statusName(status) {
-  return {
-    not_logged_in: "未登录",
-    logged_in: "已登录",
-    confirmed: "已确认",
-    answering: "答题中",
-    submitted: "已提交",
-    forced: "已强制收卷",
-    waiting: "待开始",
-    running: "进行中",
-    ended: "已结束",
-  }[status] || status;
-}
-
-renderHome();
+/* ============================================
+   初始化（i18n 异步加载）
+   ============================================ */
+(async function bootstrap() {
+  try {
+    await i18n.init();
+  } catch (e) {
+    console.error("i18n init failed", e);
+  }
+  i18n.onChange(() => {
+    // 切换语言后重新渲染当前页
+    if (state.role === "teacher" && state.token) renderTeacher();
+    else if (state.role === "student" && state.token) {
+      if (state.currentRecordId && state.examData) renderExam();
+      else if (state.studentExams && state.studentExams.length) renderStudentExamList();
+      else renderStudentGate();
+    } else renderHome();
+  });
+  renderHome();
+})();
