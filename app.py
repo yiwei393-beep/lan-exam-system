@@ -16,7 +16,8 @@ from flask import Flask, Response, g, jsonify, request, send_from_directory
 from seed_data import QUESTIONS, STUDENTS
 
 
-app = Flask(__name__, static_folder="static", static_url_path="")
+app = Flask(__name__, instance_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "instance"),
+            static_folder="static", static_url_path="")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-before-production")
 app.config["DATABASE"] = os.environ.get(
     "DATABASE_PATH", os.path.join(app.instance_path, "exam.sqlite")
@@ -1535,6 +1536,15 @@ def results():
         exam_id = cur["id"] if cur else 0
     if not exam_id:
         return fail("NO_EXAM_AVAILABLE", 404)
+    data = _build_results_data(exam_id, class_name)
+    return ok({**data, "exam_id": exam_id, "class_name": class_name})
+
+
+def _build_results_data(exam_id, class_name=""):
+    """根据考试与班级过滤聚合学生-成绩数据，供 results() 与 export_results() 共用。
+    返回结构: {"results": [...], "stats": {...}}
+    不依赖 Flask request 上下文，可在任意位置直接调用。
+    """
     sql = """
         SELECT s.student_id, s.name, s.class_name, r.id AS record_id, r.status,
                r.attempt_no,
@@ -1583,7 +1593,7 @@ def results():
         "pass_rate": round(sum(1 for s in scores if s >= 60) / len(scores) * 100, 2) if scores else 0,
         "count": len(scores),
     }
-    return ok({"results": items, "stats": stats, "exam_id": exam_id, "class_name": class_name})
+    return {"results": items, "stats": stats}
 
 
 @app.route("/api/teacher/classes")
@@ -1598,38 +1608,47 @@ def list_classes():
 @app.route("/api/teacher/export")
 @auth_required("teacher")
 def export_results():
-    """导出：format=xlsx|csv；支持 exam_id / class_name 过滤。"""
+    """导出成绩：format=xlsx|csv。
+
+    自定义导出支持三种范围（互斥，由 class_name 决定）：
+      - 指定 class_name：仅导出该班级的成绩（Excel 一个 Sheet，CSV 仅该班级）。
+      - class_name=__ALL__ 或不传：导出全部班级（Excel 汇总 + 按班级分 Sheet；CSV 全部）。
+    始终通过 exam_id 限定为单场考试的数据。
+    """
     fmt = str(request.args.get("format", "xlsx")).lower()
     exam_id = int(request.args.get("exam_id") or 0)
-    class_name = str(request.args.get("class_name", "")).strip()
+    raw_class = str(request.args.get("class_name", "")).strip()
     if not exam_id:
         cur = current_exam()
         exam_id = cur["id"] if cur else 0
+    if not exam_id:
+        return fail("NO_EXAM_AVAILABLE", 404)
+    # 规范化班级参数：__ALL__ 视为「全部班级」，空值同义
+    if raw_class.lower() in ("", "__all__", "all"):
+        class_name = ""
+        scope_label = "all"
+    else:
+        class_name = raw_class
+        scope_label = "class"
     exam = db().execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone() if exam_id else None
     exam_title = safe_filename(exam["name"] if exam else f"exam_{exam_id}", default="exam")
-    cn_class = safe_filename(class_name, default="all")
+    cn_class = safe_filename(class_name, default="all_classes")
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    data = _build_results_data(exam_id, class_name)
+    rows = data["results"]
     if fmt == "csv":
-        # 复用 results 接口逻辑（避免重复代码）
-        with app.test_request_context(
-            f"/api/teacher/results?exam_id={exam_id}&class_name={class_name}"
-        ):
-            # results() 在缺少 token 时会返回 (Response, code) 元组；用 _unwrap 处理
-            r = results()
-            resp = r[0] if isinstance(r, tuple) else r
-            body = resp.get_json() or {}
-            data = body.get("data") or {"results": [], "stats": {}}
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["学号", "姓名", "班级", "客观分", "主观分", "总分", "排名", "状态", "提交时间"])
-        for row in data["results"]:
+        for row in rows:
             writer.writerow([
                 row["student_id"], row["name"], row["class_name"] or "",
                 row["objective_score"], row["subjective_score"], row["total_score"],
                 row.get("rank") or "", row["status"] or "未登录", row.get("submit_time") or "",
             ])
         csv_bytes = output.getvalue().encode("utf-8-sig")
-        filename = f"成绩单_{exam_title}_{cn_class}_{ts}.csv"
+        suffix = "全部班级" if scope_label == "all" else class_name
+        filename = f"成绩单_{exam_title}_{suffix}_{ts}.csv"
         return Response(
             csv_bytes,
             mimetype="text/csv; charset=utf-8",
@@ -1641,14 +1660,6 @@ def export_results():
         from openpyxl.styles import Font, PatternFill, Alignment
     except ImportError:
         return fail("OPENPYXL_MISSING", 500)
-    with app.test_request_context(
-        f"/api/teacher/results?exam_id={exam_id}&class_name={class_name}"
-    ):
-        r = results()
-        resp = r[0] if isinstance(r, tuple) else r
-        body = resp.get_json() or {}
-        data = body.get("data") or {"results": [], "stats": {}}
-    rows = data["results"]
     wb = Workbook()
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="4A90D9")
@@ -1679,7 +1690,8 @@ def export_results():
         ws.append(["", stats.get("count", 0), stats.get("average", 0),
                    stats.get("highest", 0), stats.get("lowest", 0), stats.get("pass_rate", 0)])
 
-    if class_name:
+    if scope_label == "class":
+        # 单个班级：单 Sheet
         ws = wb.active
         ws.title = class_name[:30]
         write_header(ws)
@@ -1687,6 +1699,7 @@ def export_results():
         ws.append([])
         write_stats(ws, data["stats"])
     else:
+        # 全部班级：汇总 Sheet + 按班级分 Sheet
         ws = wb.active
         ws.title = "汇总"
         write_header(ws)
@@ -1704,7 +1717,8 @@ def export_results():
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
-    filename = f"成绩单_{exam_title}_{cn_class}_{ts}.xlsx"
+    suffix = "全部班级" if scope_label == "all" else class_name
+    filename = f"成绩单_{exam_title}_{suffix}_{ts}.xlsx"
     return Response(
         out.getvalue(),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2011,6 +2025,31 @@ VALID_QUESTION_TYPES = {
 }
 
 
+def _normalize_question_type(qtype):
+    raw = str(qtype or "single_choice").strip()
+    aliases = {
+        "单选题": "single_choice",
+        "单选": "single_choice",
+        "single": "single_choice",
+        "single_choice": "single_choice",
+        "多选题": "multiple_choice",
+        "多选": "multiple_choice",
+        "multiple": "multiple_choice",
+        "multiple_choice": "multiple_choice",
+        "判断题": "true_false",
+        "判断": "true_false",
+        "是非题": "true_false",
+        "true_false": "true_false",
+        "简答题": "short_answer",
+        "简答": "short_answer",
+        "short_answer": "short_answer",
+        "填空题": "fill_blank",
+        "填空": "fill_blank",
+        "fill_blank": "fill_blank",
+    }
+    return aliases.get(raw, raw)
+
+
 def _parse_options_text(text):
     """解析选项文本，支持 'A. xxx' 或 'A、xxx'，多行分隔。"""
     if not text:
@@ -2053,8 +2092,8 @@ def _parse_answer_text(answer_text, qtype):
             return "false"
         return s
     if qtype == "fill_blank":
-        # 多种分隔：换行 / | / ，
-        parts = [p.strip() for p in s.replace("\n", "|").replace("，", "|").split("|") if p.strip()]
+        # 多种分隔：换行 / | / 中文逗号 / 英文逗号
+        parts = [p.strip() for p in s.replace("\n", "|").replace("，", "|").replace(",", "|").split("|") if p.strip()]
         return json.dumps(parts, ensure_ascii=False)
     # short_answer
     return s
@@ -2133,12 +2172,12 @@ def _parse_excel_paper(file_obj):
             return v if v is not None else default
         q = {
             "question_no": get("question_no", len(questions) + 1),
-            "type": str(get("type", "single_choice")).strip(),
+            "type": _normalize_question_type(get("type", "single_choice")),
             "content": str(get("content", "")).strip(),
             "content_en": str(get("content_en", "")).strip(),
             "options": _parse_options_text(get("options", "")),
             "options_en": _parse_options_text(get("options_en", "")),
-            "answer": _parse_answer_text(get("answer", ""), str(get("type", "single_choice")).strip()),
+            "answer": _parse_answer_text(get("answer", ""), _normalize_question_type(get("type", "single_choice"))),
             "score": int(get("score", 0) or 0),
             "keywords": [],
         }

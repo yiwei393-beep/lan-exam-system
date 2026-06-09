@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>局域网考试系统</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <!-- i18n：词条 → 核心 → app，按 defer 顺序解析执行 -->
+    <script src="/i18n/zh-CN.js" defer></script>
+    <script src="/i18n/en-US.js" defer></script>
+    <script src="/i18n/index.js" defer></script>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
